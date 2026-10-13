@@ -1,0 +1,11 @@
+# Validation build, not for flashing: the personal build (which has the SCD41 package) plus cloud recipes
+# and common/recipe-co2.yaml, so recipes set CO2 Limit per phase. CI runs `esphome config` and the safety
+# checks on every validate-*.yaml. To use it for real, add the two package lines to your own build.
+
+packages:
+  build: !include terrashroom.yaml
+  cloud_recipes: !include common/cloud-recipes.yaml
+  recipe_co2: !include common/recipe-co2.yaml
+
+esphome:
+  build_path: build/validate-recipe-co2   # relative to .esphome/; keeps the personal build's dir clean

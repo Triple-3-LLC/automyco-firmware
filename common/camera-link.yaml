@@ -1,0 +1,128 @@
+# The camera link (main Serial2: RX GPIO16, TX GPIO17, 115200; confirmed 2026-10-03) and the camera
+# firmware install. Included by both the owner's and the public build. How it works, and the entity
+# contract the iOS app relies on: docs/camera-install.md.
+#
+#   Camera Install         write "<version> <sha256>" (a published board: camera release) to install it
+#   Camera Install Status  idle, starting camera, sending Wi-Fi, requesting firmware, downloading,
+#                          restarting camera, installed, already installed, or failed: <reason>
+#   Camera Firmware        the camera's last ready line: camera/0.1.7.09 (stock) or automyco-camera/<version>
+#   Camera Address         the AutoMyco camera's IP once it's on Wi-Fi
+#   Camera Reset Login     clears the camera's login (within 30 min of power-on, or 2 min after a 2-4 s hold)
+#   Camera Power Cycle     camera power off 10 s, then on (the camera's frame watchdog asks for the same)
+#
+# The chamber's Wi-Fi password goes to the camera over this wire, as the stock firmware did. It is
+# never logged; a bench build that adds `debug:` to cam_uart must redact it (camera_uart_test.yaml).
+
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [camera_link]
+
+uart:
+  - id: cam_uart
+    rx_pin: GPIO16
+    tx_pin: GPIO17
+    baud_rate: 115200
+    rx_buffer_size: 2048
+
+camera_link:
+  id: cam_link
+  uart_id: cam_uart
+  camera_power: camera_power
+  status:
+    name: Camera Install Status
+    web_server:
+      sorting_group_id: grp_maint
+      sorting_weight: 4
+  firmware:
+    name: Camera Firmware
+    web_server:
+      sorting_group_id: grp_maint
+      sorting_weight: 5
+  address:
+    name: Camera Address
+    web_server:
+      sorting_group_id: grp_maint
+      sorting_weight: 6
+  # Every camera power cycle (the button, the camera's frame watchdog, each install round) comes through
+  # here as "camera power-cycled: <reason>". It feeds the counter and the reason sensor below and the
+  # serial log (camera_link logs it at WARN), not the 600-byte event log: a camera that asks for a cycle
+  # every hour would push the owner's real events out of it.
+  on_event:
+    - lambda: |-
+        static const std::string prefix = "camera power-cycled: ";
+        const std::string reason = message.rfind(prefix, 0) == 0 ? message.substr(prefix.size()) : message;
+        id(camera_power_cycles).publish_state(++id(camera_cycle_count));
+        id(camera_last_cycle_reason).publish_state(reason);
+
+globals:
+  - id: camera_cycle_count    # camera power cycles, kept across reboots
+    type: uint32_t
+    restore_value: true
+    initial_value: "0"
+
+sensor:
+  - platform: template
+    id: camera_power_cycles
+    name: Camera Power Cycles
+    icon: mdi:counter
+    accuracy_decimals: 0
+    state_class: total_increasing
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: return id(camera_cycle_count);
+    web_server:
+      sorting_group_id: grp_maint
+      sorting_weight: 9
+
+text_sensor:
+  - platform: template
+    id: camera_last_cycle_reason   # why the camera was last power-cycled; empty until the first cycle this boot
+    name: Camera Last Cycle Reason
+    icon: mdi:camera-retake-outline
+    entity_category: diagnostic
+    update_interval: never
+    web_server:
+      sorting_group_id: grp_maint
+      sorting_weight: 10
+
+text:
+  - platform: template
+    id: camera_install_request
+    name: Camera Install
+    icon: mdi:camera-plus
+    entity_category: config
+    mode: text
+    max_length: 100   # "<version up to 24> <64 hex>"
+    optimistic: false
+    lambda: return {""};   # write-only: it always reads back empty
+    set_action:
+      - lambda: id(cam_link)->start_install(x);
+    web_server:
+      sorting_group_id: grp_maint
+      sorting_weight: 7
+
+button:
+  # A hard power cycle (camera power off 10 s, then on). This is the camera restart to use: the camera's
+  # own Camera Restart is a soft reboot that keeps the sensor powered, and a wedged OV2640 ("Got invalid
+  # frame from camera!") only recovers with its power removed (2026-10-09).
+  - platform: template
+    id: camera_power_cycle
+    name: Camera Power Cycle
+    icon: mdi:camera-retake
+    on_press:
+      - lambda: id(cam_link)->power_cycle("Camera Power Cycle button");
+    web_server:
+      sorting_group_id: grp_maint
+      sorting_weight: 3
+  - platform: template
+    id: camera_reset_login
+    name: Camera Reset Login
+    icon: mdi:account-key
+    entity_category: config
+    on_press:
+      - lambda: id(cam_link)->reset_login();
+    web_server:
+      sorting_group_id: grp_maint
+      sorting_weight: 8

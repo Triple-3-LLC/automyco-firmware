@@ -1,0 +1,252 @@
+# Opt-in fleet health reports. With "Share Diagnostics" on, the chamber sends a small JSON report to
+# automyco.com 3 minutes after boot and every 6 hours: firmware version, why it last restarted, the
+# backtrace if that was a crash, heap, Wi-Fi signal, and how often the sensors and interlocks tripped.
+# A puller on the project's server copies the reports into InfluxDB for the fleet Grafana dashboard
+# (docs/fleet-updates.md). It's how every chamber in the field becomes a bench session.
+#
+# Off by default, and nothing is sent while it's off. Never sent: Wi-Fi names or passwords, IP or MAC
+# addresses, grow names, the event log, or anything from the camera. The full field list is in
+# docs/fleet-updates.md and site/lambda/fleet.mjs (the server drops anything else).
+#
+# Needs common/cloud-identity.yaml (device ID, token and the cloud_http client). Both main-board
+# builds include it:
+#   packages:
+#     fleet_health: !include common/fleet-health.yaml
+
+substitutions:
+  fleet_build: public   # which config the image came from; the personal build overrides this
+
+# Full core dumps on chambers that kept the stock partition table (64 KB `coredump` partition at 0x3F0000,
+# which OTA migration never removes). On a panic or watchdog, ESP-IDF writes every task's registers and
+# stack there (ELF, CRC32) before the reboot; fleet_health.h reads the summary at the next boot and
+# docs/fleet-updates.md "Core dumps" says how to pull and decode the whole thing over serial. ESPHome's own
+# partition table (web installer) has no coredump partition: ESP-IDF then skips the dump and reboots as
+# before. ESP-IDF's core dump log strings are off (they sit in DRAM, heap the TLS sessions need), and the
+# check at boot is ours (fleet_health.h), so it can erase a dump that doesn't check out.
+esp32:
+  framework:
+    advanced:
+      include_builtin_idf_components: [espcoredump]   # ESPHome leaves it out of the build by default
+    sdkconfig_options:
+      CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH: "y"
+      CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF: "y"
+      CONFIG_ESP_COREDUMP_CHECKSUM_CRC32: "y"
+      CONFIG_ESP_COREDUMP_CHECK_BOOT: "n"
+      CONFIG_ESP_COREDUMP_LOGS: "n"
+
+esphome:
+  includes:
+    - fleet_health.h
+  on_boot:
+    - priority: 900   # as early as on_boot allows, so crashes during setup are caught too
+      then:
+        - lambda: |-
+            ts01_install_panic_hook();   // fleet_health.h: keeps a crash backtrace across the reboot
+    - priority: -100
+      then:
+        - lambda: |-
+            id(fleet_reset_reason) = ts01_reset_reason();
+            id(fleet_crash_json) = ts01_take_crash_json();   // read (and clear) even when not sharing
+            // Core dump, on chambers that kept the stock partition table (fleet_health.h; sdkconfig at the top of this file).
+            const auto cd = ts01_take_coredump(id(fleet_coredump_id), id(fleet_crash_json));
+            if (cd.id != id(fleet_coredump_id)) {
+              id(fleet_coredump_id) = cd.id;
+              ts_persist_now(fleet_coredump_id);   // report a dump once, even if the power goes next
+            }
+            if (!cd.json.empty()) {
+              id(fleet_crash_json) += (id(fleet_crash_json).empty() ? "" : ",") + cd.json;
+              id(log_event).execute(cd.event);
+            }
+            id(fleet_boots) += 1;
+            if (ts01_reset_is_fault()) {
+              id(fleet_faults) += 1;
+              id(log_event).execute(std::string("restarted after a fault: ") + id(fleet_reset_reason));
+            }
+
+globals:
+  - id: fleet_boots          # boots since the last serial install (saved)
+    type: uint32_t
+    restore_value: true
+    initial_value: "0"
+  - id: fleet_faults         # panic / watchdog / brownout resets since the last serial install (saved)
+    type: uint32_t
+    restore_value: true
+    initial_value: "0"
+  - id: fleet_reset_reason
+    type: std::string
+  - id: fleet_crash_json     # this boot's crash record, sent once with the first report
+    type: std::string
+  - id: fleet_coredump_id    # checksum of the core dump last reported (0 = none), so each is reported once
+    type: uint32_t
+    restore_value: true
+    initial_value: "0"
+  - id: fleet_first_sent     # the first report of this boot was accepted (it carries "first":true)
+    type: bool
+    initial_value: "false"
+  # Counted since the last report sent (RAM only):
+  - id: fleet_sensor_faults  # HDC1080 reading went missing or stale
+    type: uint32_t
+    initial_value: "0"
+  - id: fleet_overtemps      # temperature above the heater cut-off
+    type: uint32_t
+    initial_value: "0"
+  - id: fleet_low_waters     # Low Water came on
+    type: uint32_t
+    initial_value: "0"
+  - id: fleet_hard_stops     # atomizer hard stop latched
+    type: uint32_t
+    initial_value: "0"
+  - id: fleet_prev_flags     # last sampled bits: 1 sensor fault, 2 over-temp, 4 low water, 8 hard stop
+    type: uint8_t
+    initial_value: "0"
+  - id: fleet_next_at        # millis() when the next report is due
+    type: uint32_t
+    initial_value: "0"
+
+switch:
+  - platform: template
+    id: share_diagnostics
+    name: Share Diagnostics
+    icon: mdi:chart-box-outline
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    on_turn_on:
+      - script.execute: { id: log_event, msg: "diagnostics sharing on" }
+      - script.execute: fleet_send_report
+    on_turn_off:
+      - script.execute: { id: log_event, msg: "diagnostics sharing off" }
+    web_server:
+      sorting_group_id: grp_health
+      sorting_weight: 10
+
+text_sensor:
+  - platform: template
+    id: last_reset_reason
+    name: Last Reset Reason
+    icon: mdi:restart-alert
+    entity_category: diagnostic
+    lambda: return id(fleet_reset_reason);
+    update_interval: 60s
+    web_server:
+      sorting_group_id: grp_health
+      sorting_weight: 11
+
+sensor:
+  - platform: template
+    id: fleet_free_heap
+    name: Free Heap
+    unit_of_measurement: B
+    icon: mdi:memory
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    lambda: return (float) heap_caps_get_free_size(MALLOC_CAP_8BIT);
+    update_interval: 60s
+    web_server:
+      sorting_group_id: grp_health
+      sorting_weight: 12
+  - platform: template
+    id: fleet_min_free_heap
+    name: Lowest Free Heap
+    unit_of_measurement: B
+    icon: mdi:memory
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    lambda: return (float) heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
+    update_interval: 60s
+    web_server:
+      sorting_group_id: grp_health
+      sorting_weight: 13
+  # Half of what decides whether a TLS handshake can start: cloud_post.h needs a 20 KB block (mbedTLS's
+  # 16.7 KB record buffer) and 48 KB free in total (common/tls_budget.h). Already in the health report as
+  # heap_block; this shows it live.
+  - platform: template
+    id: fleet_largest_free_block
+    name: Largest Free Block
+    unit_of_measurement: B
+    icon: mdi:memory
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    lambda: return (float) heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+    update_interval: 60s
+    web_server:
+      sorting_group_id: grp_health
+      sorting_weight: 13
+
+interval:
+  # Count fault edges every 10 s (sampling is enough: these conditions last far longer than that).
+  - interval: 10s
+    then:
+      - lambda: |-
+          const float t = id(temperature).state;
+          const bool stale = (uint32_t) (millis() - id(last_climate_update)) > ${stale_sensor_s} * 1000UL;
+          uint8_t f = 0;
+          if (id(booted) && !id(hdc_heating) && (isnan(t) || isnan(id(humidity).state) || stale)) f |= 1;
+          if (!isnan(t) && t > ${max_safe_temp_f}) f |= 2;
+          if (id(low_water).state) f |= 4;
+          if (id(atomizer_hard_stop).state) f |= 8;
+          const uint8_t rising = f & ~id(fleet_prev_flags);
+          if (rising & 1) id(fleet_sensor_faults)++;
+          if (rising & 2) id(fleet_overtemps)++;
+          if (rising & 4) id(fleet_low_waters)++;
+          if (rising & 8) id(fleet_hard_stops)++;
+          id(fleet_prev_flags) = f;
+  # First report 3 min after boot, then every 6 h; a failed one is retried after 30 min.
+  - interval: 60s
+    startup_delay: 180s
+    then:
+      - lambda: |-
+          const int st = ts01_post_status;
+          if (st == 1) return;   // in flight
+          if (st != 0) {         // a request finished: take its result once
+            ts01_post_status = 0;
+            if (st == 200 || st == 204) {
+              id(fleet_next_at) = millis() + 6 * 3600 * 1000UL;
+              id(fleet_sensor_faults) = id(fleet_overtemps) = id(fleet_low_waters) = id(fleet_hard_stops) = 0;
+              id(fleet_crash_json).clear();
+              id(fleet_first_sent) = true;
+            } else {
+              ESP_LOGW("fleet", "report not accepted (HTTP %d); retrying in 30 min", st);
+              id(fleet_next_at) = millis() + 1800 * 1000UL;
+            }
+            return;
+          }
+          if ((int32_t) (millis() - id(fleet_next_at)) < 0) return;
+          id(fleet_next_at) = millis() + 1800 * 1000UL;   // if this one is skipped, look again in 30 min
+          id(fleet_send_report).execute();
+
+script:
+  - id: fleet_send_report
+    mode: single
+    then:
+      - lambda: |-
+          if (!id(share_diagnostics).state || !network::is_connected()) return;
+          char buf[640];
+          const float t = id(temperature).state, h = id(humidity).state, gd = id(grow_day).state;
+          const float rssi = wifi::global_wifi_component->wifi_rssi();
+          // current_option() is a StringRef: pass .c_str() to varargs, and keep quotes out of the JSON.
+          char preset[48];
+          ts01_json_safe(preset, sizeof(preset), id(grow_preset).current_option().c_str());
+          int n = snprintf(buf, sizeof(buf),
+              "{\"schema\":1,\"first\":%s,\"board\":\"main\",\"build\":\"${fleet_build}\",\"v\":\"%s\",\"esphome\":\"%s\","
+              "\"reset\":\"%s\",\"up\":%lu,\"boots\":%lu,\"faults\":%lu,"
+              "\"heap_free\":%u,\"heap_min\":%u,\"heap_block\":%u,\"rssi\":%d,"
+              "\"sensor_faults\":%lu,\"overtemps\":%lu,\"low_waters\":%lu,\"hard_stops\":%lu,"
+              "\"climate\":%s,\"grow_day\":%d,\"preset\":\"%s\"",
+              id(fleet_first_sent) ? "false" : "true", ESPHOME_PROJECT_VERSION, ESPHOME_VERSION, id(fleet_reset_reason).c_str(),
+              (unsigned long) (millis() / 1000), (unsigned long) id(fleet_boots), (unsigned long) id(fleet_faults),
+              (unsigned) heap_caps_get_free_size(MALLOC_CAP_8BIT), (unsigned) heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT),
+              (unsigned) heap_caps_get_largest_free_block(MALLOC_CAP_8BIT), isnan(rssi) ? 0 : (int) rssi,
+              (unsigned long) id(fleet_sensor_faults), (unsigned long) id(fleet_overtemps),
+              (unsigned long) id(fleet_low_waters), (unsigned long) id(fleet_hard_stops),
+              id(climate_control).state ? "true" : "false", isnan(gd) ? 0 : (int) gd, preset);
+          if (n <= 0 || n >= (int) sizeof(buf)) return;
+          std::string body(buf, n);
+          // No reading (sensor fault, dry pulse) = no field. A stand-in number would plot as a reading.
+          if (!isnan(t)) { n = snprintf(buf, sizeof(buf), ",\"temp_f\":%.1f", t); body.append(buf, n); }
+          if (!isnan(h)) { n = snprintf(buf, sizeof(buf), ",\"rh\":%.1f", h); body.append(buf, n); }
+          if (!id(fleet_crash_json).empty()) body += "," + id(fleet_crash_json);
+          body += "}";
+          if (!ts01_post_async(id(cloud_http), "${cloud_base_url}/api/device/report", body,
+                               id(cloud_device_id).data(), id(cloud_device_token).data()))
+            ESP_LOGW("fleet", "report skipped (busy, or not enough heap for TLS)");

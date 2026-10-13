@@ -1,0 +1,319 @@
+# Stock-camera timelapse: set up the STOCK camera board (camera/0.1.7.09) the way the stock main board did,
+# so it uploads frames to our revived api./app.terrashroom.org (cloud/stock-compat, docs/stock-timelapse.md).
+#
+# Include it as a package (needs common/terrashroom-core.yaml, common/cloud-identity.yaml and
+# common/camera-link.yaml, which owns the camera's UART):
+#   packages:
+#     stock_camera_timelapse: !include common/stock-camera-timelapse.yaml
+#
+# The link (LOG.md 2026-10-03 ~04:39, analysis/firmware_findings.md "camera"): main Serial2, RX=GPIO16,
+# TX=GPIO17, 115200 8N1, newline-delimited JSON. The camera is powered by GPIO26 (core's Camera Power) and
+# says {"status":"ready","version":"camera/0.1.7.09"} when it boots. Stock then sends, in this order:
+#   {"ssid":"…","password":"…"}                                          the chamber's Wi-Fi, in plaintext
+#   {"timelapse":true,"interval":N,"flash":false,"bucket_id":"…"}        timelapse settings
+# Here bucket_id is this chamber's random cloud_device_id, so the server can tell whose frames arrive and
+# the stock URL https://app.terrashroom.org/timelapse/<cloud_device_id>/latest.jpg shows them.
+#
+# Grow day: the camera knows nothing about grows. This package registers the current grow (grow_start) with
+# the server (POST /ts01/grow, Bearer cloud_device_token), and the server files every frame under
+# stock/<id>/grows/<grow_start>/day-<NNN>/.
+#
+# Everything defaults OFF. Turning Timelapse on powers the camera and hands it the Wi-Fi credentials.
+#
+# Unknowns, checked on the first bench run (docs/stock-timelapse.md):
+#   - the unit of "interval" (we send minutes x ${stock_camera_interval_scale}, i.e. seconds by default). If
+#     the camera turns out to take milliseconds, the runaway guard below switches timelapse off.
+#   - how the camera uploads. The server logs the first contact.
+# GPIO16/17 are PSRAM pins on WROVER modules: this package is for WROOM-type modules only.
+
+substitutions:
+  stock_api_url: https://api.terrashroom.org        # the camera's host; /ts01/grow lives on the same API
+  stock_camera_interval_scale: "60"                 # minutes -> the camera's "interval" unit (assumed seconds)
+
+# cam_uart and the line reader are common/camera-link.yaml's (camera_link is the only reader of the
+# camera's console); this package handles each line in camera_link's on_line below.
+
+http_request:
+  verify_ssl: true   # ESP-IDF certificate bundle; the API uses an Amazon (ACM) certificate
+  timeout: 10s
+
+globals:
+  - id: cam_ready             # camera has said "ready" since it was last powered
+    type: bool
+    initial_value: "false"
+  - id: cam_power_since       # millis() camera power was last seen turning on (0 = off)
+    type: uint32_t
+    initial_value: "0"
+  - id: cam_last_capture      # millis() of the last "Camera capture successful" (0 = none)
+    type: uint32_t
+    initial_value: "0"
+  - id: cam_frames            # captures the camera reported since boot
+    type: int
+    initial_value: "0"
+  - id: grow_auth             # "Bearer <cloud_device_token>", kept alive for the request (never logged)
+    type: std::string
+  - id: grow_registered       # grow_start last registered with the server (UINT32_MAX = not yet)
+    type: uint32_t
+    initial_value: "UINT32_MAX"
+  - id: grow_reg_fails        # consecutive failed registrations (backoff 1, 2, 4 ... 60 min)
+    type: int
+    initial_value: "0"
+  - id: grow_reg_next         # millis() before which no registration is attempted (backoff)
+    type: uint32_t
+    initial_value: "0"
+
+switch:
+  - platform: template
+    id: timelapse_on
+    name: Timelapse
+    icon: mdi:camera-timer
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    web_server:
+      sorting_group_id: grp_grow
+      sorting_weight: 20
+    on_turn_on:
+      - switch.turn_on: camera_power        # Wi-Fi + settings follow when the camera says "ready"
+      - if:
+          condition:
+            lambda: return id(cam_ready);
+          then:
+            - script.execute: camera_setup
+      - script.execute: register_grow
+      - script.execute: { id: log_event, msg: "timelapse on" }
+    on_turn_off:
+      - if:
+          condition:
+            lambda: return id(cam_ready);
+          then:
+            - script.execute: send_camera_settings
+      - script.execute: { id: log_event, msg: "timelapse off" }
+
+  - platform: template
+    id: timelapse_flash
+    name: Timelapse Flash
+    icon: mdi:flash
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    entity_category: config
+    web_server:
+      sorting_group_id: grp_grow
+      sorting_weight: 22
+    on_turn_on:
+      - if: { condition: { lambda: return id(cam_ready); }, then: [script.execute: send_camera_settings] }
+    on_turn_off:
+      - if: { condition: { lambda: return id(cam_ready); }, then: [script.execute: send_camera_settings] }
+
+number:
+  - platform: template
+    id: timelapse_interval
+    name: Timelapse Interval
+    icon: mdi:timer-outline
+    unit_of_measurement: min
+    min_value: 5
+    max_value: 1440
+    step: 5
+    initial_value: 30
+    optimistic: true
+    restore_value: true
+    mode: box
+    entity_category: config
+    web_server:
+      sorting_group_id: grp_grow
+      sorting_weight: 21
+    on_value:
+      - if: { condition: { lambda: return id(cam_ready); }, then: [script.execute: send_camera_settings] }
+
+text_sensor:
+  - platform: template
+    id: camera_status
+    name: Camera Status
+    icon: mdi:camera
+    entity_category: diagnostic
+    update_interval: never
+    web_server:
+      sorting_group_id: grp_maint
+      sorting_weight: 4
+  # Camera Firmware (the version in the ready line) is camera_link's (common/camera-link.yaml).
+
+sensor:
+  - platform: template
+    id: camera_frames
+    name: Timelapse Frames Since Boot
+    icon: mdi:counter
+    accuracy_decimals: 0
+    state_class: total_increasing
+    entity_category: diagnostic
+    update_interval: never
+    web_server:
+      sorting_group_id: grp_maint
+      sorting_weight: 6
+
+script:
+  # One JSON line to the camera. Never logged: the Wi-Fi line carries the password.
+  - id: cam_write
+    parameters:
+      line: std::string
+    then:
+      - uart.write:
+          id: cam_uart
+          data: !lambda |-
+            std::string s = line + "\n";
+            return std::vector<uint8_t>(s.begin(), s.end());
+
+  - id: send_camera_settings
+    mode: queued
+    then:
+      - lambda: |-
+          const bool on = id(timelapse_on).state;
+          const float mins = id(timelapse_interval).state;
+          const long interval = on && !isnan(mins) ? (long) mins * ${stock_camera_interval_scale} : 0;
+          const char *bucket = on ? id(cloud_device_id).data() : "";
+          char line[160];
+          snprintf(line, sizeof(line), "{\"timelapse\":%s,\"interval\":%ld,\"flash\":%s,\"bucket_id\":\"%s\"}",
+                   on ? "true" : "false", interval, id(timelapse_flash).state ? "true" : "false", bucket);
+          ESP_LOGI("camera", "=> %s", line);   // no secrets in this one
+          id(cam_write).execute(std::string(line));
+
+  # What stock did on "ready": Wi-Fi first, then the timelapse settings. Only when timelapse is on, so a
+  # camera powered for other reasons (bench, Camera Power switch) never gets the Wi-Fi password.
+  - id: camera_setup
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: return id(timelapse_on).state && !id(cam_link)->installing();
+          then:
+            - lambda: |-
+                auto esc = [](const std::string &in) {
+                  std::string out;
+                  for (char c : in) {
+                    if (c == '"' || c == '\\') { out += '\\'; out += c; }
+                    else if ((unsigned char) c < 0x20) { char u[8]; snprintf(u, sizeof(u), "\\u%04x", c); out += u; }
+                    else out += c;
+                  }
+                  return out;
+                };
+                auto sta = wifi::global_wifi_component->get_sta();
+                std::string ssid(sta.get_ssid().c_str(), sta.get_ssid().size());
+                std::string pass(sta.get_password().c_str(), sta.get_password().size());
+                if (ssid.empty()) { ESP_LOGW("camera", "no Wi-Fi network saved; camera not configured"); return; }
+                ESP_LOGI("camera", "=> Wi-Fi credentials (not logged)");
+                id(cam_write).execute("{\"ssid\":\"" + esc(ssid) + "\",\"password\":\"" + esc(pass) + "\"}");
+            - delay: 500ms
+            - script.execute: send_camera_settings
+
+  # Tell the server which grow this chamber is on, so frames land in the right grow and day.
+  # The POST blocks the main loop for the length of the request (TLS: 1-3 s), and the heater's
+  # over-temperature cut-off runs on that loop, so like the check-in it only goes out while the heater is
+  # off. A failure backs off 1, 2, 4 ... 60 min instead of retrying every minute.
+  - id: register_grow
+    mode: single
+    then:
+      - if:
+          condition:
+            and:
+              - wifi.connected:
+              - lambda: |-
+                  if (!id(timelapse_on).state || strlen(id(cloud_device_id).data()) != 32) return false;
+                  if (id(heater).state) return false;   // retried by the 60 s interval once it's off
+                  return (int32_t) (millis() - id(grow_reg_next)) >= 0;
+          then:
+            - lambda: 'id(grow_auth) = std::string("Bearer ") + id(cloud_device_token).data();'
+            - http_request.post:
+                url: ${stock_api_url}/ts01/grow
+                request_headers:
+                  Content-Type: application/json
+                  Authorization: !lambda 'return id(grow_auth).c_str();'   # header values are const char*
+                body: !lambda |-
+                  char b[200];
+                  float d = id(grow_day).state;
+                  snprintf(b, sizeof(b),
+                           "{\"device_id\":\"%s\",\"grow_start\":%lu,\"grow_day\":%d,\"interval_s\":%ld,\"fw\":\"%s\",\"timelapse\":true}",
+                           id(cloud_device_id).data(), (unsigned long) id(grow_start), isnan(d) ? 0 : (int) d,
+                           (long) id(timelapse_interval).state * 60, ESPHOME_PROJECT_VERSION);
+                  return std::string(b);
+                on_response:
+                  then:
+                    - lambda: |-
+                        ESP_LOGI("camera", "grow registration: HTTP %d", response->status_code);
+                        if (response->status_code == 200) { id(grow_registered) = id(grow_start); id(grow_reg_fails) = 0; id(grow_reg_next) = 0; }
+                        else id(grow_reg_backoff).execute();
+                on_error:
+                  then:
+                    - logger.log: { level: WARN, tag: camera, format: "grow registration failed (network/TLS)" }
+                    - script.execute: grow_reg_backoff
+
+  - id: grow_reg_backoff
+    then:
+      - lambda: |-
+          if (id(grow_reg_fails) < 30) id(grow_reg_fails)++;
+          const uint32_t mins = std::min(60UL, 1UL << std::min(id(grow_reg_fails) - 1, 6));
+          id(grow_reg_next) = (millis() + mins * 60000UL) | 1;
+          ESP_LOGW("camera", "grow registration: next try in %u min", (unsigned) mins);
+
+interval:
+  # Camera power and liveness. Stock power-cycled a silent camera; this only reports it.
+  - interval: 5s
+    then:
+      - lambda: |-
+          if (!id(camera_power).state) {
+            if (id(cam_power_since) || id(cam_ready)) id(camera_status).publish_state("off");
+            id(cam_power_since) = 0;
+            id(cam_ready) = false;
+            return;
+          }
+          if (!id(cam_power_since)) {
+            id(cam_power_since) = millis();
+            id(camera_status).publish_state("booting");
+          }
+          if (!id(cam_ready) && millis() - id(cam_power_since) > 30000 && id(camera_status).state != "no response")
+            id(camera_status).publish_state("no response");
+
+  # Register the grow when it changes (new grow started), and every 6 h so the server sees the grow day.
+  # register_grow itself waits for the heater to be off and for the backoff to pass.
+  - interval: 60s
+    then:
+      - if:
+          condition:
+            lambda: return id(timelapse_on).state && id(grow_registered) != id(grow_start);
+          then:
+            - script.execute: register_grow
+  - interval: 6h
+    then:
+      - lambda: id(grow_registered) = UINT32_MAX;   # the 60 s interval re-registers, with the guards above
+
+camera_link:
+  # Each line from the camera's console (camera_link reads cam_uart; see common/camera-link.yaml).
+  on_line:
+    - lambda: |-
+          if (line.empty()) return;
+          std::string low = line;
+          for (auto &ch : low) ch = tolower(ch);
+          // The camera echoes what it receives (=> {...}), Wi-Fi password included: never log those lines.
+          if (low.find("ssid") != std::string::npos || low.find("pass") != std::string::npos) {
+            ESP_LOGD("camera", "<= <line with Wi-Fi credentials redacted, %u bytes>", (unsigned) line.size());
+          } else {
+            ESP_LOGD("camera", "<= %s", line.c_str());
+          }
+          if (line.find("\"status\":\"ready\"") != std::string::npos) {
+            id(cam_ready) = true;   // camera_link publishes the version as Camera Firmware
+            id(camera_status).publish_state("ready");
+            // Not during a camera firmware install: camera_link owns the conversation then, and a timelapse
+            // settings line would land in the middle of the stock updater's command stream.
+            if (!id(cam_link)->installing()) id(camera_setup).execute();
+          } else if (line.find("Camera capture successful") != std::string::npos) {
+            const uint32_t now = millis();
+            const uint32_t gap = id(cam_last_capture) ? now - id(cam_last_capture) : UINT32_MAX;
+            id(cam_last_capture) = now;
+            id(camera_frames).publish_state(++id(cam_frames));
+            id(camera_status).publish_state("capturing");
+            // Runaway guard: the interval's unit is unconfirmed. Captures under 20 s apart mean the camera
+            // read it as something much shorter than intended (ms?). Stop before it floods the uploads.
+            if (gap < 20000 && id(timelapse_on).state) {
+              id(log_event).execute("timelapse runaway: captures " + to_string(gap / 1000) + " s apart; off");
+              id(timelapse_on).turn_off();
+            }
+          } else if (line.find("Not connected to WiFi") != std::string::npos) {
+            id(camera_status).publish_state("no Wi-Fi");
+          }

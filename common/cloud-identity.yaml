@@ -1,0 +1,339 @@
+# Cloud identity: who this chamber is to automyco.com (update checks, opt-in health reports, push alerts,
+# remote access).
+#
+# Include it as a package. Both main-board builds do:
+#   packages:
+#     cloud_identity: !include common/cloud-identity.yaml
+#
+# Made up on the chamber's first boot and saved in flash, never derived from the MAC address or anything
+# else that identifies the hardware. Neither is ever shown on an entity or in the log:
+#   cloud_device_id     32 hex characters (128 random bits). Sent as `X-Device-Id` on every request to the
+#                       server and used to place the chamber in a staged-rollout group.
+#   cloud_device_token  64 hex characters (256 random bits). Sent as `Authorization: Bearer <token>`. The
+#                       server keeps only its SHA-256, bound to the ID.
+# What the chamber shows instead (common/cloud_identity.h, site/lambda/handle.mjs):
+#   Cloud Device ID     the public handle: the first 12 hex of SHA-256(cloud_device_id). An owner can tell
+#                       support which chamber is theirs, and the iOS app names the chamber by it when it
+#                       registers for push alerts. It can't be turned back into the ID.
+#   Push Pairing Code   8 hex, LAN only, a new one every hour: HMAC-SHA256(SHA-256(token), hour). The app
+#                       sends it with the push registration; the server recomputes it from the token hash it
+#                       holds. Seeing it proves the phone was on the chamber's LAN within the hour, so the
+#                       Cloud Device ID alone (a screenshot, a support ticket) can't subscribe a phone.
+# Binding: on the first boot (and every boot after that until it works, 1, 2, 4 ... 60 min apart) the
+# chamber makes one authenticated POST ${cloud_base_url}/api/device/hello. That binds the token to the ID
+# on the server minutes after first power-up, before anyone could have read the handle off the chamber,
+# and before the chamber ever opts into anything else. The hello carries nothing but the credentials.
+# A serial erase (factory reset) wipes both values, so the chamber starts over with a new identity. Updates
+# keep it.
+#
+# Token rotation (docs/device-api.md "Cloud identity"). The token is in flash (NVS), so anyone who had the
+# chamber on a serial cable could read it and go on posting telemetry, alerts and reports as the chamber
+# after selling it. So the chamber replaces its token, keeping the ID (the handle, push subscriptions and
+# the remote-access owner all stay), after things only someone at the chamber can do:
+#   - a remote-access pairing (Remote Pairing Code accepted; remote-access.yaml),
+#   - an update pairing (a phone paired in the rear-button Pair window; terrashroom-public.yaml),
+#   - "Reset Cloud Identity", which only works while that Pair window is open (terrashroom-public.yaml).
+# Each rotation names its trigger ("reason": update_pair, remote_pair or reset; token_rotation.h). Only
+# "reset" makes the server do more: it also drops the ID's push subscriptions, so a previous owner's phone
+# stops getting this chamber's alerts (docs/device-api.md "Rotation reasons").
+# cloud_rotate_start makes the new token and keeps it in `cloud_token_next` (saved). The interval below
+# writes it to flash, then POSTs ${cloud_base_url}/api/device/rotate { next_hash: SHA-256(new token) }
+# authenticated with the old token; the server swaps the hash in one conditional write. Power-cut safety:
+#   1. new token saved as "next" before the server can learn it; the old token stays the token
+#   2. server answers 2xx: token := next, still keeping next, and that reaches flash first
+#   3. then next is cleared
+# Each step is written with ts_persist_now (common/persist_now.h), so it is on flash before the next one
+# starts. So flash never holds the old token without the new one. A cut before (2) retries with the same pair,
+# which the server answers 200 without a second swap; next == token at boot means (3) was lost.
+# 401 means the old token is no longer this ID's (someone holding a copy rotated it first): the chamber
+# gives up that ID and starts over with a new ID and token, bound by a fresh hello. That costs the old
+# ID's push subscriptions and remote pairing, which a person at the chamber then sets up again; the copy
+# holder is left with an ID nobody uses. 429 (at most one rotation per 10 min) waits 10 min.
+#
+# The IDs are generated at priority -100, after Wi-Fi has started and the ESP32 RNG is a real entropy
+# source (the same reason terrashroom-public.yaml waits until then for its OTA lock).
+
+substitutions:
+  # Every cloud feature talks to this host and nothing else. Releases up to 1.1.0 used
+  # https://beezy.ninja: the same CloudFront distribution, API, device table and token binding, which
+  # keeps answering for them permanently (site/README.md). So the first boot after an update to this
+  # host keeps the chamber's ID and token, and its first hello on automyco.com matches the stored hash.
+  cloud_base_url: https://automyco.com
+
+# The one HTTPS client every cloud package uses (update checks, health reports, alerts, recipes).
+# Certificates are checked against ESPHome's built-in CA bundle; automyco.com and S3 use Amazon roots.
+http_request:
+  id: cloud_http
+  verify_ssl: true
+  timeout: 10s
+  useragent: AutoMyco
+  # esp_http_client writes the whole request line ("GET <path>?<query> HTTP/1.1") into the TX buffer and
+  # fails with "Out of buffer" when it doesn't fit. At the default 512 B a redirect to a presigned S3 URL
+  # (1,519 chars with the Lambda's session token) could never be followed: 1.2.2's self-update died on
+  # exactly that (2026-10-11, docs/fleet-updates.md). The server now serves firmware without a redirect,
+  # and 2048 B is the backstop. Response headers stream through the parser in pieces (a long Location is
+  # appended across reads), so the RX buffer stays at its default. Cost: 1.5 KB more heap per request,
+  # freed with the client (common/tls_budget.h).
+  buffer_size_tx: 2048
+  # Never follow a redirect. esp_http_client re-sends the request headers to the Location it's given,
+  # Authorization: Bearer <token> included, so a 3xx from anything on the path (a misconfigured CDN rule, a
+  # captive portal, a spoofed answer before TLS) would hand the token to another host. Nothing this client
+  # fetches redirects: the API answers itself, recipes are static on the same host, and firmware is served
+  # from the Lambda without a redirect since #177 (site/lambda/fleet.mjs). A 3xx is just a failed request.
+  follow_redirects: false
+
+esphome:
+  includes:
+    - common/tls_budget.h      # how much heap a TLS session needs (cloud_post.h's gate)
+    - cloud_post.h             # the one FreeRTOS task + in-flight slot every cloud request goes through
+    - common/cloud_identity.h  # handle, pairing code, hello backoff
+    - common/token_rotation.h  # token rotation steps (host-tested: tests/test_token_rotation.cpp)
+  on_boot:
+    - priority: -100
+      then:
+        - lambda: |-
+            bool made = false;
+            if (strnlen(id(cloud_device_id).data(), 33) != 32) {
+              id(cloud_device_id).fill(0);
+              ts_identity::fill_random_hex(id(cloud_device_id).data(), 16);
+              made = true;
+            }
+            if (strnlen(id(cloud_device_token).data(), 65) != 64) {
+              id(cloud_device_token).fill(0);
+              ts_identity::fill_random_hex(id(cloud_device_token).data(), 32);
+              id(cloud_token_next).fill(0);   // a rotation for a token that's gone means nothing
+              made = true;
+            }
+            if (made) {
+              id(cloud_bound) = false;   // a fresh identity is unknown to the server, whatever flash said
+              // Saved before the first hello: a token the server has seen but flash lost is refused for good.
+              ts_persist_now(cloud_device_id, cloud_device_token, cloud_bound);
+            }
+            auto &nxt = id(cloud_token_next);
+            ts_rotation::boot_fixup(id(cloud_device_token).data(), nxt.data());   // step 3 lost to a power cut
+            id(cloud_rotate_at) = millis() + 20000;   // a pending rotation goes first, before other cloud requests
+            id(cloud_identity_status).publish_state(nxt[0] != '\0' ? "Replacing token" : id(cloud_bound) ? "OK" : "Registering");
+            char handle[13];
+            ts_identity::public_handle(id(cloud_device_id).data(), handle);
+            id(cloud_device_id_sensor).publish_state(handle);
+            id(cloud_hello_at) = millis() + 45000;   // first hello 45 s after boot, once Wi-Fi is up
+
+globals:
+  - id: cloud_device_id
+    type: std::array<char, 33>
+    restore_value: true
+    initial_value: 'std::array<char, 33>{}'
+  - id: cloud_device_token
+    type: std::array<char, 65>
+    restore_value: true
+    initial_value: 'std::array<char, 65>{}'
+  - id: cloud_token_next      # a new token waiting for the server's yes (rotation; empty = none pending)
+    type: std::array<char, 65>
+    restore_value: true
+    initial_value: 'std::array<char, 65>{}'
+  - id: cloud_rotate_fails    # rotation attempts that didn't get an answer we could act on, for the backoff
+    type: uint32_t
+    initial_value: "0"
+  - id: cloud_rotate_at       # millis() when the rotation may take its next step
+    type: uint32_t
+    initial_value: "0"
+  - id: cloud_rotate_reason   # why the pending rotation was queued (ts_rotation::Reason), sent as "reason" (saved)
+    type: uint8_t
+    restore_value: true
+    initial_value: "0"
+  - id: cloud_bound           # the server has accepted this ID + token pair at least once (saved)
+    type: bool
+    restore_value: true
+    initial_value: "false"
+  - id: cloud_hello_fails     # hello attempts that didn't get a 2xx, for the backoff
+    type: uint32_t
+    initial_value: "0"
+  - id: cloud_hello_at        # millis() when the next hello may go
+    type: uint32_t
+    initial_value: "0"
+  - id: cloud_pairing_bucket  # the hour the shown pairing code belongs to
+    type: uint32_t
+    initial_value: "0"
+
+script:
+  # Queues a token rotation (see the top of this file). Callers have already checked physical presence
+  # (a pairing went through, or the rear-button Pair window is open). One pending rotation covers any
+  # number of triggers: the old token dies either way.
+  - id: cloud_rotate_start
+    parameters:
+      why: std::string
+      reason: int   # ts_rotation::REASON_UPDATE_PAIR / REASON_REMOTE_PAIR / REASON_RESET
+    then:
+      - lambda: |-
+          auto &nxt = id(cloud_token_next);
+          // Replaced seconds ago and still finishing (step 3): that already killed any old copy, and
+          // overwriting `next` now could leave flash with the old token alone.
+          if (ts_rotation::committed(id(cloud_device_token).data(), nxt.data())) return;
+          if (!ts_rotation::pending(id(cloud_device_token).data(), nxt.data())) {
+            nxt.fill(0);
+            ts_identity::fill_random_hex(nxt.data(), 32);
+            id(cloud_rotate_fails) = 0;
+            id(cloud_rotate_at) = millis() + 3000;
+            id(cloud_rotate_reason) = ts_rotation::REASON_NONE;   // a fresh rotation starts with no reason
+          }
+          // Several triggers before it completes: the strongest reason is sent (reset > remote_pair > update_pair).
+          id(cloud_rotate_reason) = ts_rotation::merge_reason(id(cloud_rotate_reason), (uint8_t) reason);
+          ts_persist_now(cloud_token_next, cloud_rotate_reason);   // step 1 on flash before the server can learn its hash
+          id(cloud_identity_status).publish_state("Replacing token");
+          id(log_event).execute("cloud token rotation queued (" + why + ")");
+
+text_sensor:
+  - platform: template
+    id: cloud_identity_status
+    name: Cloud Identity
+    icon: mdi:shield-key-outline
+    entity_category: diagnostic
+    update_interval: never
+    web_server:
+      sorting_group_id: grp_health
+      sorting_weight: 10
+  - platform: template
+    id: cloud_device_id_sensor
+    name: Cloud Device ID
+    icon: mdi:identifier
+    entity_category: diagnostic
+    update_interval: never
+    web_server:
+      sorting_group_id: grp_health
+      sorting_weight: 9
+  - platform: template
+    id: push_pairing_code
+    name: Push Pairing Code
+    icon: mdi:cellphone-key
+    entity_category: diagnostic
+    update_interval: never
+    web_server:
+      sorting_group_id: grp_health
+      sorting_weight: 22
+
+interval:
+  # First-boot binding: one authenticated hello, retried with backoff until the server says yes.
+  - interval: 15s
+    then:
+      - lambda: |-
+          const int st = ts_identity::g_hello_status;
+          if (st == 1) return;   // in flight
+          if (st != 0) {         // a hello finished: take its result once
+            ts_identity::g_hello_status = 0;
+            if (st >= 200 && st < 300) {
+              id(cloud_bound) = true;
+              id(cloud_hello_fails) = 0;
+              // A new identity (first boot, or a start-over after a refused rotation) is on flash from here.
+              ts_persist_now(cloud_device_id, cloud_device_token, cloud_token_next, cloud_bound);
+              if (id(cloud_token_next)[0] == '\0') id(cloud_identity_status).publish_state("OK");
+              id(log_event).execute("cloud identity bound");
+              return;
+            }
+            // 401 means another token already holds this ID (the server was reached before this flash with
+            // a different token): keep trying at the slowest pace, in case it's the server that's wrong.
+            id(cloud_hello_fails) += 1;
+            id(cloud_hello_at) = millis() + ts_identity::hello_delay_ms(st == 401 ? 99 : id(cloud_hello_fails));
+            ESP_LOGW("cloud", "hello answered HTTP %d; next try in %lu min", st,
+                     (unsigned long) (ts_identity::hello_delay_ms(st == 401 ? 99 : id(cloud_hello_fails)) / 60000UL));
+            return;
+          }
+          if (id(cloud_bound) || id(cloud_token_next)[0] != '\0') return;   // a pending rotation binds too
+          if (!network::is_connected() || strnlen(id(cloud_device_id).data(), 33) != 32) return;
+          if ((int32_t) (millis() - id(cloud_hello_at)) < 0) return;
+          if (!ts_cloud::post_async(id(cloud_http), "${cloud_base_url}/api/device/hello", "{}",
+                                    id(cloud_device_id).data(), id(cloud_device_token).data(),
+                                    ts_identity::g_hello_status, "ts01_hello")) {
+            id(cloud_hello_at) = millis() + 30000;   // another cloud request is running, or low heap
+          }
+  # Token rotation (see the top of this file).
+  - interval: 5s
+    then:
+      - lambda: |-
+          auto &tok = id(cloud_device_token);
+          auto &nxt = id(cloud_token_next);
+          const int st = ts_identity::g_rotate_status;
+          if (st == 1) return;   // in flight
+          if (st != 0) {         // a rotation finished: take its result once
+            ts_identity::g_rotate_status = 0;
+            const auto answer = ts_rotation::classify(st);
+            if (answer == ts_rotation::COMMIT) {
+              // Step 2: the new token is the token. `next` keeps the same value until this is on flash.
+              memcpy(tok.data(), nxt.data(), tok.size());
+              id(cloud_bound) = true;
+              id(cloud_rotate_reason) = ts_rotation::REASON_NONE;
+              ts_persist_now(cloud_device_token, cloud_bound, cloud_rotate_reason);   // step 2 on flash before step 3
+              id(cloud_rotate_fails) = 0;
+              id(cloud_rotate_at) = millis() + 3000;
+              id(cloud_pairing_bucket) = 0;   // the Push Pairing Code is derived from the token
+              ts_identity::g_token_gen++;
+              id(cloud_identity_status).publish_state("OK (token replaced)");
+              id(log_event).execute("cloud token replaced");
+              return;
+            }
+            if (answer == ts_rotation::START_OVER) {
+              // The old token isn't this ID's any more: someone with a copy rotated it first. Start over.
+              id(cloud_device_id).fill(0);
+              ts_identity::fill_random_hex(id(cloud_device_id).data(), 16);
+              tok.fill(0);
+              ts_identity::fill_random_hex(tok.data(), 32);
+              nxt.fill(0);
+              id(cloud_bound) = false;
+              id(cloud_rotate_reason) = ts_rotation::REASON_NONE;   // a new ID has no subscriptions to drop
+              id(cloud_hello_fails) = 0;
+              id(cloud_hello_at) = millis() + 5000;
+              id(cloud_pairing_bucket) = 0;
+              ts_identity::g_token_gen++;
+              ts_persist_now(cloud_device_id, cloud_device_token, cloud_token_next, cloud_bound);
+              char handle[13];
+              ts_identity::public_handle(id(cloud_device_id).data(), handle);
+              id(cloud_device_id_sensor).publish_state(handle);
+              id(cloud_identity_status).publish_state("New identity (pair remote access and push again)");
+              id(log_event).execute("cloud identity replaced: the old token was refused");
+              return;
+            }
+            id(cloud_rotate_fails) += 1;
+            const uint32_t wait = answer == ts_rotation::WAIT_RATE_LIMIT ? 600000UL : ts_identity::hello_delay_ms(id(cloud_rotate_fails));
+            id(cloud_rotate_at) = millis() + wait;
+            ESP_LOGW("cloud", "token rotation answered HTTP %d; next try in %lu min", st, (unsigned long) (wait / 60000UL));
+            return;
+          }
+          if (nxt[0] == '\0' || (int32_t) (millis() - id(cloud_rotate_at)) < 0) return;
+          if (ts_rotation::committed(tok.data(), nxt.data())) {
+            ts_persist_now(cloud_device_token);   // step 2 is on flash (again, cheap) ...
+            nxt.fill(0);                          // ... before step 3
+            ts_persist_now(cloud_token_next);
+            return;
+          }
+          if (!ts_rotation::pending(tok.data(), nxt.data())) {
+            nxt.fill(0);   // junk
+            id(cloud_rotate_reason) = ts_rotation::REASON_NONE;
+            return;
+          }
+          if (!network::is_connected() || strnlen(id(cloud_device_id).data(), 33) != 32) return;
+          ts_persist_now(cloud_token_next, cloud_rotate_reason);   // step 1 on flash before the server can learn the new token's hash
+          char hash[65];
+          ts_identity::sha256_hex(nxt.data(), 64, hash);
+          // "reason" (token_rotation.h): saved with the pending token, so a replay after a lost answer or a
+          // power cut sends the same one. Servers without the field ignore it.
+          char body[128];
+          ts_rotation::rotate_body(hash, id(cloud_rotate_reason), body, sizeof(body));
+          if (!ts_cloud::post_async(id(cloud_http), "${cloud_base_url}/api/device/rotate", body,
+                                    id(cloud_device_id).data(), tok.data(),
+                                    ts_identity::g_rotate_status, "ts01_rotate")) {
+            id(cloud_rotate_at) = millis() + 15000;   // another cloud request is running, or low heap
+          }
+  # Push Pairing Code: a new one each hour (needs the clock; blank until SNTP has synced).
+  - interval: 10s
+    then:
+      - lambda: |-
+          auto now = id(sntp_time).now();
+          if (!now.is_valid() || strnlen(id(cloud_device_token).data(), 65) != 64) {
+            if (!id(push_pairing_code).state.empty()) id(push_pairing_code).publish_state("");
+            return;
+          }
+          const uint32_t bucket = (uint32_t) (now.timestamp / 3600);
+          if (bucket == id(cloud_pairing_bucket) && !id(push_pairing_code).state.empty()) return;
+          char code[9];
+          if (!ts_identity::pairing_code(id(cloud_device_token).data(), bucket, code)) return;
+          id(cloud_pairing_bucket) = bucket;
+          id(push_pairing_code).publish_state(code);

@@ -1,0 +1,42 @@
+# Cloud recipes set CO2 Limit per grow phase: the recipe's pinning_co2_ppm in Pinning, fruiting_co2_ppm
+# in Fruiting (site/public/recipes/v1/index.json, revision 2 on). Opt-in, for builds with a CO2 sensor:
+#   packages:
+#     scd41: !include common/scd41.yaml               # CO2 Limit
+#     cloud_recipes: !include common/cloud-recipes.yaml
+#     recipe_co2: !include common/recipe-co2.yaml
+#
+# Why a separate package: the public image has cloud recipes but no SCD41, and has to fit the stock app
+# slot. This package turns on the TS_RECIPES_CO2 build flag, and only then does common/cloud_recipes.h
+# read the two fields, store them in the cached recipe set (its own flash slot) and call the hook below.
+# Without it the public image is byte-for-byte what it was.
+#
+# Behaviour
+#   - When a recipe's stage is applied (picked, refreshed with new values, or Grow Day moves it on) and
+#     whenever Grow Phase changes, CO2 Limit is set to the chosen recipe's target for the phase.
+#   - Incubation leaves CO2 Limit alone (the CO2 control ignores it there), and so does a recipe with no
+#     target for the phase. Values are clamped to CO2 Limit's 400-5000 ppm range on the chamber.
+#   - Setting CO2 Limit by hand doesn't turn the recipe off; the next phase change sets it again.
+#     Cloud Recipe None (or any hand setpoint edit, which turns it to None) leaves CO2 Limit as it is.
+#   - Nothing here can touch UV-C, fans or the atomizer: it only writes the CO2 Limit number.
+
+esphome:
+  build_flags:
+    - -DTS_RECIPES_CO2
+  on_boot:
+    - priority: -100   # the same pass as cloud-recipes.yaml's restore; nothing is applied at boot
+      then:
+        - lambda: |-
+            ts_recipes::g_co2_hook = [](const ts_recipes::Recipe &r) {
+              const std::string phase = id(grow_phase).current_option();
+              const int ppm = ts_recipes::co2_for_phase(r.pinning_co2_100, r.fruiting_co2_100, phase);
+              if (ppm < 0 || id(co2_limit).state == (float) ppm) return;
+              id(co2_limit).make_call().set_value(ppm).perform();
+              char msg[80];
+              snprintf(msg, sizeof(msg), "recipe %s: CO2 Limit %d ppm (%s)", r.name, ppm, phase.c_str());
+              id(log_event).execute(msg);
+            };
+            id(grow_phase)->add_on_state_callback([](size_t) {
+              if (!id(booted) || id(cloud_recipe_quiet)) return;
+              const ts_recipes::Recipe *r = ts_recipes::find(ts_recipes::g_set, id(cloud_recipe_sel).data());
+              if (r != nullptr) ts_recipes::after_apply(*r);
+            });

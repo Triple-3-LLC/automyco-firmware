@@ -1,0 +1,227 @@
+# Optional add-on: Sensirion SCD41 CO2 sensor (also reads temperature and humidity).
+#
+# Include it as a second package in a build (terrashroom.yaml does):
+#   packages:
+#     core: !include common/terrashroom-core.yaml
+#     scd41: !include common/scd41.yaml
+#
+# Wiring: it shares the HDC1080's I2C bus (3V3, GND, SDA on GPIO21, SCL on GPIO22) at address 0x62, so
+# it can't clash with the HDC1080 (0x40) or the INA219 (0x45). Use a breakout board, not a bare sensor,
+# and a short Y-lead from the HDC1080 connector. See docs/co2-fresh-air.md and esphome/README.md
+# ("Optional: SCD41 CO2 sensor").
+#
+# If the sensor isn't fitted, ESPHome logs a setup error, marks this component failed and runs everything
+# else as usual. The CO2 entities then read unavailable.
+#
+# CO2-driven fresh air (issue #26, docs/co2-fresh-air.md; the decision logic is common/co2_control.h,
+# host-tested in tests/test_co2_control.cpp): with Climate Control on and the grow phase Pinning or
+# Fruiting, CO2 above CO2 Limit asks the core controller for a fresh-air exchange and holds it open until
+# CO2 is back at or below the limit minus CO2 Hysteresis: at least Fresh Air Duration, at most CO2
+# Exchange Max. It then rests CO2 Exchange Gap before another CO2 start, never starts during a humidify
+# cycle, and ends early when RH falls 10 % under the humidity target. Incubation ignores CO2 (a colonising
+# block tolerates it). The timer schedule carries on as the floor of fresh air. With the sensor missing,
+# failed or stale (no reading for 2 min) the schedule alone runs, exactly as in a build without this file.
+
+substitutions:
+  scd41_altitude: "0m"        # height above sea level, for the CO2 pressure correction
+  scd41_fresh_air_ppm: "430"  # outdoor CO2 used by Calibrate CO2. Global background is ~430 ppm
+                              # in 2026 (approximate); use a local reading if you have one.
+
+esphome:
+  includes:
+    - common/co2_control.h
+
+# The on-chamber climate history (core's chamber_history) records CO2 as well when this package is in.
+chamber_history:
+  co2: co2
+
+globals:
+  - id: co2_at                # millis() of the last CO2 reading, stored | 1 (0 = never read)
+    type: uint32_t
+    initial_value: "0"
+
+sensor:
+  - platform: scd4x
+    id: scd41
+    # Automatic self-calibration is OFF on purpose. It assumes the sensor sees ~400 ppm fresh air at
+    # least once a week and treats the lowest reading it sees as that. A closed grow chamber often sits
+    # well above outdoor CO2 for days, so it would drag the baseline down and read low (and so call for
+    # too little fresh air). The factory calibration holds; Calibrate CO2 corrects drift.
+    automatic_self_calibration: false
+    altitude_compensation: ${scd41_altitude}
+    measurement_mode: periodic   # a new reading every 5 s; ESPHome reads the latest one
+    update_interval: 30s
+    co2:
+      id: co2
+      name: CO2
+      on_value:
+        - lambda: if (!isnan(x)) id(co2_at) = millis() | 1;   # freshness for the CO2 control
+      web_server:
+        sorting_group_id: grp_air
+        sorting_weight: 0
+    temperature:
+      id: scd41_temperature
+      name: SCD41 Temperature
+      entity_category: diagnostic   # the HDC1080 stays the chamber's temperature; this is a cross-check
+      unit_of_measurement: "°F"
+      accuracy_decimals: 1
+      filters:
+        - lambda: return x * 1.8f + 32.0f;
+      web_server:
+        sorting_group_id: grp_health
+        sorting_weight: 20
+    humidity:
+      id: scd41_humidity
+      name: SCD41 Humidity
+      entity_category: diagnostic
+      accuracy_decimals: 1
+      web_server:
+        sorting_group_id: grp_health
+        sorting_weight: 21
+
+binary_sensor:
+  - platform: template
+    id: co2_exchange
+    name: CO2 Exchange   # ON while a CO2-driven exchange is held open
+    icon: mdi:molecule-co2
+    web_server:
+      sorting_group_id: grp_air
+      sorting_weight: 10
+
+number:
+  - platform: template
+    id: co2_limit
+    name: CO2 Limit
+    icon: mdi:molecule-co2
+    unit_of_measurement: ppm
+    min_value: 0          # anything below 400 ppm (outdoor air) switches the CO2 trigger off
+    max_value: 5000
+    step: 100
+    optimistic: true
+    restore_value: true
+    initial_value: 1500
+    entity_category: config
+    web_server:
+      sorting_group_id: grp_air
+      sorting_weight: 0
+  - platform: template
+    id: co2_hysteresis
+    name: CO2 Hysteresis   # an exchange ends once CO2 <= CO2 Limit - this
+    icon: mdi:arrow-collapse-vertical
+    unit_of_measurement: ppm
+    min_value: 50
+    max_value: 1000
+    step: 50
+    optimistic: true
+    restore_value: true
+    initial_value: 200
+    entity_category: config
+    web_server:
+      sorting_group_id: grp_air
+      sorting_weight: 11
+  - platform: template
+    id: co2_exchange_max
+    name: CO2 Exchange Max   # longest a CO2-driven exchange is held open
+    icon: mdi:timer-outline
+    unit_of_measurement: min
+    min_value: 1
+    max_value: 60
+    step: 1
+    optimistic: true
+    restore_value: true
+    initial_value: 15
+    entity_category: config
+    web_server:
+      sorting_group_id: grp_air
+      sorting_weight: 12
+  - platform: template
+    id: co2_exchange_gap
+    name: CO2 Exchange Gap   # rest after a CO2-driven exchange before the next CO2 start (protects RH)
+    icon: mdi:timer-pause-outline
+    unit_of_measurement: min
+    min_value: 1
+    max_value: 60
+    step: 1
+    optimistic: true
+    restore_value: true
+    initial_value: 5
+    entity_category: config
+    web_server:
+      sorting_group_id: grp_air
+      sorting_weight: 13
+
+interval:
+  # The CO2 control. It never drives a fan: it asks the core for an exchange (next_fresh_air), holds
+  # the core's exchange open (fresh_air_until) and ends it. The core pauses misting while it runs.
+  - interval: 1s
+    then:
+      - lambda: |-
+          namespace c2 = co2_control;   // no "using namespace": State, Config would clash with esphome names
+          static c2::State st;
+          static bool was_ok = false;
+          const uint32_t now = millis();
+          const std::string phase = id(grow_phase).current_option();
+          const float hs = id(humidity_setpoint).state;
+          const c2::Config cfg{id(co2_limit).state, id(co2_hysteresis).state,
+                           (uint32_t) id(fresh_air_duration).state * 1000UL,
+                           (uint32_t) id(co2_exchange_max).state * 60000UL,
+                           (uint32_t) id(co2_exchange_gap).state * 60000UL};
+          c2::Inputs in;
+          in.now = now;
+          in.ppm = id(co2).state;
+          in.ppm_at = id(co2_at);
+          in.enabled = id(climate_control).state && !id(self_test).is_running() && phase != "Incubation";
+          in.exchange_running = (int32_t) (id(fresh_air_until) - now) > 0;
+          in.exchange_start = id(last_fresh_air);
+          in.humidify_cycle = id(hum_cycle_start) != 0;
+          in.rh = id(humidity).state;
+          in.rh_target = grow_climate::humidity_target(grow_climate::phase_from(phase.c_str()), hs,   // as the core controller
+              grow_climate::pinning_rh_for(std::string(id(grow_preset).current_option()).c_str(), id(species_pinning_rh)));
+
+          // One Event Log line when a working sensor goes quiet (fresh air falls back to the timer).
+          const bool ok = c2::sensor_ok(in);
+          if (was_ok && !ok) id(log_event).execute("CO2 sensor lost: fresh air on the timer only");
+          was_ok = ok;
+
+          const c2::Result r = c2::step(st, cfg, in);
+          switch (r.action) {
+            case c2::Do::START:
+              ESP_LOGI("co2", "%.0f ppm > %.0f ppm limit: fresh-air exchange", in.ppm, cfg.limit_ppm);
+              id(next_fresh_air) = now | 1;   // the next controller tick starts an exchange (0 = "unscheduled")
+              break;
+            case c2::Do::HOLD:
+              if (r.why != c2::Why::NONE) ESP_LOGI("co2", "holding the exchange open (%s, %.0f ppm)", c2::why_name(r.why), in.ppm);
+              id(fresh_air_until) = r.until;
+              // Keep the timer from starting a new exchange while this one is held (it would cut it to
+              // Fresh Air Duration and count twice); the schedule restarts from the end of the hold.
+              if ((int32_t) (id(next_fresh_air) - r.until) < 0) id(next_fresh_air) = r.until | 1;
+              break;
+            case c2::Do::STOP: {
+              ESP_LOGI("co2", "exchange ended: %s (%.0f ppm)", c2::why_name(r.why), in.ppm);
+              // Two-phase: finish with the exhaust half (the core reads "less than half left" as exhaust).
+              const bool two_phase = std::string(id(fresh_air_mode).current_option()) == "Two-phase";
+              id(fresh_air_until) = two_phase ? now + cfg.min_on_ms / 2 : now;
+              break;
+            }
+            case c2::Do::NOTHING:
+              break;
+          }
+          if (!id(co2_exchange).has_state() || id(co2_exchange).state != st.active) id(co2_exchange).publish_state(st.active);
+
+button:
+  # Forced recalibration: put the sensor in fresh outdoor air (or by an open window with nobody
+  # breathing near it), wait at least 3 minutes for the readings to settle, then press.
+  - platform: template
+    name: Calibrate CO2 (fresh air)
+    icon: mdi:molecule-co2
+    entity_category: config
+    on_press:
+      - scd4x.perform_forced_calibration:
+          id: scd41
+          value: ${scd41_fresh_air_ppm}
+      - script.execute:
+          id: log_event
+          msg: "CO2 sensor calibrated to ${scd41_fresh_air_ppm} ppm"
+    web_server:
+      sorting_group_id: grp_maint
+      sorting_weight: 20

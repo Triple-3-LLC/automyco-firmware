@@ -1,0 +1,525 @@
+# Terrashroom TS-01: the public build, safe to hand to strangers (published on automyco.com).
+#
+# Same controller, interlocks and entities as the personal build (common/terrashroom-core.yaml, included
+# unchanged). The only difference is the network layer. This image contains no Wi-Fi credentials and
+# no key or password shared by every chamber that runs it. Each chamber gets its own on first boot.
+# The security model, what's left exposed, and how an owner locks the chamber down: README.md
+# ("Public build").
+#
+#   esphome compile terrashroom-public.yaml   # needs no secrets.yaml
+#
+# How a chamber running this build gets its credentials:
+#   Wi-Fi    Improv over the serial cable (the automyco.com flasher does it right after installing), or
+#            BLE Improv from a phone, authorised by pressing the rear button. No setup hotspot: an
+#            open one let anyone in range move an unclaimed chamber onto their own network.
+#   API key  set by Home Assistant when the owner adopts the chamber (api encryption with no key),
+#            saved in flash. From then on, only that key opens the API.
+#   OTA      ESPHome 2026.9+ lets the API key holder upload firmware (encrypted OTA). Plaintext OTA
+#            is locked with a random password made at every boot that nobody knows. The owner can
+#            replace it with their own through the set_ota_password API action (inside the rear-button
+#            Pair window) or update pairing (the iOS app, same window).
+# All of this happens inside a provisioning window that opens at power-on only (not after a software
+# restart, an OTA update or a crash: adopt_window.h), or after "Open Adoption Window" pressed inside the
+# rear-button Pair window. If the chamber is still unclaimed when it closes, BLE Improv and API key setup
+# stay shut until the next power cycle.
+
+substitutions:
+  provisioning_window: 30min   # how long after power-on the chamber can be claimed
+  checkin_build: public        # reported by the opt-in check-in (common/checkin.yaml)
+  fw_public_key: ""            # empty = signing/fw_pub.pem, or the TEST key if that's missing (fw_signing below)
+
+packages:
+  core: !include common/terrashroom-core.yaml
+  cloud_identity: !include common/cloud-identity.yaml   # random per-chamber ID + token for automyco.com
+  fleet_health: !include common/fleet-health.yaml       # opt-in health reports (Share Diagnostics, off by default)
+  push_alerts: !include common/push-alerts.yaml         # opt-in push alerts to the owner's iPhone (Push Alerts, off by default)
+  cloud_updates: !include common/cloud-updates.yaml     # update checks, staged rollout, no installs mid-grow without a second press
+  camera_link: !include common/camera-link.yaml   # camera link + camera firmware install (docs/camera-install.md)
+  checkin: !include common/checkin.yaml   # opt-in anonymous daily check-in, off by default
+  cloud_recipes: !include common/cloud-recipes.yaml     # species recipes fetched from automyco.com
+  # Stock-camera timelapse (frames from the STOCK camera board to the revived terrashroom.org API). Niche,
+  # and it costs flash in an image that must fit the stock app slot: uncomment to enable.
+  # stock_camera_timelapse: !include common/stock-camera-timelapse.yaml
+  remote_access: !include common/remote-access.yaml     # see the chamber on automyco.com/remote (off, needs pairing)
+
+esphome:
+  # Same device name as the personal build (automyco-a1b2c3.local, which the iOS app looks for), so
+  # it needs its own build dir. site/scripts/publish_firmware.py reads the images from here.
+  build_path: build/terrashroom-public   # relative to .esphome/
+  includes:
+    - public_migrate.h   # carries the stock firmware's Wi-Fi over a no-wire (BLE) install, see below
+    - update_pairing.h   # fingerprint of the password set by update pairing, see below
+    - common/ble_lifecycle.h   # when Bluetooth runs and when its RAM goes back to the heap, see esp32_ble below
+    - ble_release.h
+    - adopt_window.h   # the provisioning window opens after a power-on (or Open Adoption Window) only, see provisioning
+  on_boot:
+    # Runs before the OTA server starts, so plaintext OTA is never open. The radio is still off here,
+    # so the ESP32 RNG isn't a real entropy source yet: this is only a placeholder. The -100 entry
+    # replaces it while setup is still running. ESPHome's setup doesn't wait for Wi-Fi to connect, so
+    # nothing can reach the chamber while the placeholder is in force.
+    - priority: 800
+      then:
+        - lambda: |-
+            uint8_t rnd[16];
+            random_bytes(rnd, sizeof(rnd));
+            char pw[33];
+            for (size_t i = 0; i < sizeof(rnd); i++) snprintf(pw + 2 * i, 3, "%02x", rnd[i]);
+            id(ota_main)->set_auth_password(pw);
+            // Who may switch UV-C on and enter a Remote Pairing Code (common/owner_gate.h): a paired phone (its
+            // signed X-AutoMyco-Key got the request past web_guard) or someone at the chamber (Pair window).
+            owner_gate::presence = []() { return id(ota_pair_until) != 0 && (int32_t) (id(ota_pair_until) - millis()) > 0; };
+            owner_gate::paired = []() { return id(guard)->has_control_key(); };
+    # The provisioning window (Home Assistant adoption, BLE Improv) only after a power-on, or once after Open
+    # Adoption Window (adopt_window.h). After the API (setup priority 200) has loaded its key, and before setup
+    # ends, which is when ESPHome's window timer starts being checked.
+    - priority: 100
+      then:
+        - lambda: |-
+            const auto d = ts_adopt::decide_now(api::global_api_server->get_noise_ctx().has_psk());
+            id(adopt_boot) = d.adopt_boot;
+            // The camera can't tell a chamber power-on from a Camera Power Cycle (both cut its power), so it
+            // keeps its own window shut unless the chamber asks over the camera link: after this boot, if it is
+            // a power-on or Open Adoption Window (interval below; camera-public.yaml).
+            id(camera_api_pending) = d.window_open;
+            if (d.window_open) {
+              ESP_LOGI("security", "provisioning window open (%s)", d.adopt_boot ? "Open Adoption Window" : "power-on");
+            } else if (d.close_now) {
+              provisioning::global_provisioning_manager->set_timeout(1);   // closes on the first loop
+              ESP_LOGI("security", "provisioning window closed: not a power-on (power-cycle, or Open Adoption Window)");
+            }
+    # After Wi-Fi has started (RF on, so the RNG is a real source) and the restored globals are loaded:
+    # the owner's own OTA password if they set one, otherwise a fresh random lock.
+    - priority: -100
+      then:
+        - lambda: |-
+            const size_t n = strnlen(id(owner_ota_password).data(), id(owner_ota_password).size());
+            id(guard)->set_owner_password(std::string(id(owner_ota_password).data(), n));
+            if (n > 0) {
+              id(ota_main)->set_auth_password(std::string(id(owner_ota_password).data(), n));
+              ESP_LOGI("security", "plaintext OTA: owner's password");
+            } else {
+              id(lock_plaintext_ota).execute();
+              ESP_LOGI("security", "plaintext OTA: locked (random per-boot password)");
+            }
+
+# INFO drops the per-request and per-reading debug lines from the image (the owner's build keeps DEBUG).
+logger:
+  level: INFO
+
+script:
+  # The app reads the pairing fingerprint within seconds. Clearing it after a minute keeps a hash of the
+  # password off the unauthenticated API, where it could be tested offline if someone set a weak password by
+  # hand (the app's own passwords are ~190 random bits).
+  - id: clear_pairing_fingerprint
+    mode: restart
+    then:
+      - delay: 60s
+      - lambda: id(update_pairing_fingerprint).publish_state("");
+  # Pair window feedback: Top Light (the grow light) full white twice, then exactly as it was (on/off,
+  # colour, brightness, effect). set_save(false) throughout, so the saved light state is never touched.
+  # Only the grow light: UV-C is never part of it. A running effect restarts from its beginning.
+  - id: pair_blink
+    mode: single
+    then:
+      - lambda: |-
+          id(pair_blink_saved) = id(top_light)->remote_values;
+          id(pair_blink_effect) = id(top_light)->get_current_effect_index();
+      - repeat:
+          count: 2
+          then:
+            - lambda: |-
+                id(top_light)->make_call().set_state(true).set_effect((uint32_t) 0).set_rgb(1, 1, 1)
+                    .set_brightness(1).set_transition_length(0).set_save(false).perform();
+            - delay: 300ms
+            - lambda: |-
+                id(top_light)->make_call().set_state(false).set_transition_length(0).set_save(false).perform();
+            - delay: 300ms
+      - lambda: |-
+          const auto &v = id(pair_blink_saved);
+          auto call = id(top_light)->make_call();
+          call.from_light_color_values(v);
+          call.set_transition_length(0);
+          if (v.is_on()) call.set_effect(id(pair_blink_effect));
+          call.set_save(false);
+          call.perform();
+  - id: lock_plaintext_ota   # random password nobody knows = plaintext OTA effectively off
+    then:
+      - lambda: |-
+          uint8_t rnd[16];
+          random_bytes(rnd, sizeof(rnd));
+          char pw[33];
+          for (size_t i = 0; i < sizeof(rnd); i++) snprintf(pw + 2 * i, 3, "%02x", rnd[i]);
+          id(ota_main)->set_auth_password(pw);
+
+globals:
+  - id: stock_wifi_checked    # public_migrate.h one-shot (below): set on the first boot, whatever the outcome
+    type: bool
+    restore_value: true
+    initial_value: "false"
+  - id: owner_ota_password    # set through the set_ota_password API action or update pairing; empty = locked
+    type: std::array<char, 65>
+    restore_value: true
+    initial_value: 'std::array<char, 65>{}'
+  - id: ota_pair_until        # millis() when the update-pairing window closes; 0 = closed
+    type: uint32_t
+    initial_value: "0"
+  - id: pair_blink_saved      # Top Light state from before the Pair blink (pair_blink)
+    type: light::LightColorValues
+  - id: pair_blink_effect     # its effect index, 0 = none
+    type: uint32_t
+    initial_value: "0"
+  - id: adopt_boot            # this boot came from Open Adoption Window (adopt_window.h)
+    type: bool
+    initial_value: "false"
+  - id: camera_api_pending    # ask an AutoMyco camera to open its own adoption window once it's up
+    type: bool
+    initial_value: "false"
+
+# The controls below need proof that the caller is a phone paired at the chamber, once one has paired:
+# header X-AutoMyco-Key = hex HMAC-SHA256(SHA-256("automyco-control:" + owner OTA password),
+# "<METHOD> <request-target> <Control Challenge>"). The challenge (below) is 16 random bytes, single-use: it
+# changes the moment a header is accepted, at every boot and on every password change, so a captured header
+# is dead (components/web_guard/control_key.h). No clock is involved. Every web request that could change
+# a keyed entity is gated, in any URL spelling; only its open_action (the safe direction) stays open. Until
+# the password has loaded at boot: refused (503 starting up). No owner password: they stay open, except
+# that UV-C on and the Remote Pairing Code then need the rear-button Pair window (common/owner_gate.h). The
+# key follows owner_ota_password (boot, update pairing, set_ota_password). Home Assistant's native API is
+# unaffected (it has its own key). The iOS app signs every command it sends, so it keeps working; the
+# chamber's own web page has no key, so on a paired chamber these controls are the app's (or HA's).
+# Keep the list in step with tools/check_firmware_safety.py (REQUIRED_KEYED) and
+# apple/AutoMyco/mock_server/esphome_mock.py. docs/device-api.md "Security".
+web_guard:
+  id: guard
+  challenge_sensor: control_challenge
+  keyed_entities:
+    - name: UV-C Lamp
+      open_action: turn_off
+    - name: Camera Reset Login
+    - name: Restart                   # a restart reopened the old 30-minute adoption window; still a reset lever
+    - name: Camera Power Cycle        # the camera's own frame watchdog still asks for cycles internally
+    - name: Remote Pairing Code       # pairing hands a remote account control (remote-access.yaml)
+    - name: Water Lockout Override    # lets the atomizer run dry
+      open_action: turn_off
+    - name: Water Sensing             # Off disables the low-water lockout
+    - name: Atomizer Hard Stop        # clearing it lets the atomizer run; engaging it is always safe
+      open_action: turn_on
+    - name: Water Probe Drive
+    - name: Manual Mist Limit
+    - name: Install Firmware Update
+    - name: Auto-Install Updates
+    - name: Camera Install
+
+# A device that ships without credentials gets a time-limited claim window (ESPHome 2026.9, EN 18031).
+# It's "provisioned" once it has joined a network and the API has a key. Until then, the window runs
+# from power-on. When it expires, BLE Improv shuts down and the API
+# rejects new clients and key changes. Cycling the power reopens it (physical presence).
+# ESPHome itself would reopen it after ANY restart (its closed state is RAM only), and a keyless API takes
+# the all-zero key and lets anyone on the LAN set one, so a Restart press from the LAN would have reopened
+# a 30-minute takeover window. The on_boot entry at priority 100 closes it at once after anything but a
+# power-on, unless "Open Adoption Window" asked for it (adopt_window.h). HA adoption therefore needs a power
+# cycle, or: hold the rear button 2-4 s, then press Open Adoption Window (the chamber restarts with the
+# window open for ${provisioning_window}, and asks an AutoMyco camera to do the same).
+# Owners who never use Home Assistant never set an API key, so the window closes on every boot. That's
+# intended: the web UI and iOS app keep working, and the API stays shut.
+provisioning:
+  timeout: ${provisioning_window}
+
+api:
+  encryption: {}   # no key: Home Assistant sets a per-chamber key on adoption (saved in flash)
+  reboot_timeout: 0s   # same as the personal build: the iOS app / web UI don't use the native API
+  actions:
+    # Set (or clear, with "") the password for plaintext OTA uploads, e.g. `esphome upload` with a config
+    # that has `ota: password:`. Only accepted over an encrypted connection with the chamber's own
+    # key, never while the API is still unclaimed, and only inside the rear-button Pair window: the same
+    # password is the paired phone's control key (web_guard), so changing it is a pairing. One per hold.
+    - action: set_ota_password
+      variables:
+        password: string
+      then:
+        - lambda: |-
+            if (!api::global_api_server->get_noise_ctx().has_psk()) {
+              ESP_LOGW("security", "set_ota_password refused: the API has no encryption key yet");
+              return;
+            }
+            if (!owner_gate::present()) {
+              ESP_LOGW("security", "set_ota_password refused: hold the rear button 2-4 s first");
+              return;
+            }
+            if (!password.empty() && (password.size() < 12 || password.size() > 64)) {
+              ESP_LOGW("security", "set_ota_password refused: use 12 to 64 characters, or \"\" to lock");
+              return;
+            }
+            id(ota_pair_until) = 0;   // one password per hold, as update pairing
+            id(owner_ota_password).fill(0);
+            password.copy(id(owner_ota_password).data(), password.size());
+            ts_persist_now(owner_ota_password);
+            id(guard)->set_owner_password(password.str());   // "" clears it: keyed actions open again
+            if (password.empty()) {
+              id(lock_plaintext_ota).execute();
+              id(log_event).execute("plaintext OTA locked");
+            } else {
+              id(ota_main)->set_auth_password(password.str());
+              id(log_event).execute("OTA password changed");
+            }
+
+# Signed firmware (issue #32, docs/fleet-updates.md "Signed images"). Every OTA path (ESPHome native
+# OTA, fleet updates over ota.http_request, the iOS app) ends in ESP-IDF's esp_ota_end(), which now
+# rejects any image without a valid ECDSA P-256 signature from the AutoMyco firmware key. A rejected
+# image never boots: the running firmware carries on. Verify-on-update ONLY: no hardware secure boot,
+# no flash encryption, no eFuse is ever written, the bootloader isn't checked or replaced, so a serial
+# reflash always recovers a chamber. fw_signing (components/fw_signing) refuses to build unless these
+# are exactly so, and embeds the public key (signing/fw_pub.pem; the TEST key with a loud warning if
+# that file is missing). Images are signed at release by site/scripts/publish_firmware.py.
+# The owner build (terrashroom.yaml) stays unsigned.
+esp32:
+  framework:
+    sdkconfig_options:
+      CONFIG_SECURE_SIGNED_APPS_NO_SECURE_BOOT: "y"
+      CONFIG_SECURE_SIGNED_APPS_ECDSA_SCHEME: "y"          # Secure Boot V1 format: every ESP32 revision
+      CONFIG_SECURE_SIGNED_ON_UPDATE_NO_SECURE_BOOT: "y"
+      CONFIG_SECURE_SIGNED_ON_BOOT_NO_SECURE_BOOT: "n"     # not on boot: no new bootloader needed
+      CONFIG_SECURE_BOOT_BUILD_SIGNED_BINARIES: "n"        # the build never holds the private key
+      CONFIG_SECURE_BOOT: "n"                              # no hardware secure boot (eFuses)
+      CONFIG_SECURE_FLASH_ENC_ENABLED: "n"                 # no flash encryption (eFuses)
+
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [fw_signing]
+
+fw_signing:
+  # Override for a bench test with a throwaway key: esphome -s fw_public_key /path/bench_pub.pem compile ...
+  public_key: ${fw_public_key}
+
+ota:
+  - platform: esphome
+    id: ota_main
+    # Empty compiles in the password check; the real password is set at boot (above). No `encryption:`
+    # block: ESPHome can't require encryption with a key that's set at runtime, but it offers and uses
+    # the API key for OTA as soon as one exists.
+    password: ""
+    # While ESPHome writes the image, its main loop is blocked (up to a minute, longer on bad Wi-Fi),
+    # so neither the controller nor the heater's over-temperature cut-off runs. Leave nothing
+    # energised for that window. A failed upload resumes the controller; a good one reboots.
+    on_begin:
+      - script.stop: self_test   # it would switch loads back on if the upload failed
+      - switch.turn_off: heater
+      - switch.turn_off: atomizer
+      - switch.turn_off: uv_lamp
+
+safe_mode:
+  # Safe mode (after 10 failed boots) skips on_boot and the scripts, so lock plaintext OTA here as
+  # well (the Wi-Fi driver has started by now, so the RNG is a real source). Encrypted OTA with the chamber's saved
+  # API key still works in safe mode.
+  on_safe_mode:
+    - lambda: |-
+        uint8_t rnd[16];
+        random_bytes(rnd, sizeof(rnd));
+        char pw[33];
+        for (size_t i = 0; i < sizeof(rnd); i++) snprintf(pw + 2 * i, 3, "%02x", rnd[i]);
+        id(ota_main)->set_auth_password(pw);
+
+wifi:
+  # No networks and no access point: there's no open setup hotspot to hijack. Wi-Fi arrives over BLE
+  # Improv (needs the rear button) or serial Improv (needs the cable). The network is saved in flash
+  # and survives updates of this build. If it can't connect for 90 s after power-on (new router), BLE
+  # Improv comes back, inside the claim window. Once Wi-Fi has connected, Bluetooth is released for the
+  # rest of that boot (esp32_ble below): to move a running chamber to a new network, power-cycle it.
+
+# Chambers installed over the stock firmware's own Bluetooth OTA (tools/ble_ota.py, docs/stock-ble-ota.md)
+# keep the stock NVS, including the network set up in the Terrashroom app. So the owner doesn't have to set
+# Wi-Fi again, the FIRST boot of this build copies that network in (only if none is saved yet) and reboots
+# once to join it. The install itself needed someone at the chamber (rear button held for the stock
+# Bluetooth mode).
+# It is strictly one-shot: the check is recorded in flash before anything else, so clearing the Wi-Fi later,
+# or a network that no longer works, never brings the old stock network back. After that, Improv (below)
+# is the only way on. Known limit: a second-hand chamber's stock NVS can hold the previous owner's network,
+# which matters only if that network is in range (docs/stock-ble-ota.md).
+interval:
+  - interval: 24h
+    startup_delay: 5s   # after Wi-Fi setup has loaded any saved network
+    then:
+      - lambda: |-
+          if (id(stock_wifi_checked)) return;
+          id(stock_wifi_checked) = true;
+          ts_persist_now(stock_wifi_checked);   // recorded even if power is cut instead of the reboot
+          ts01_import_stock_wifi();
+  - interval: 1s   # Bluetooth for Improv: start, stop, release (esp32_ble below)
+    then:
+      - lambda: ts_ble::tick();
+  # After a power-on or an Open Adoption Window restart (both power-cycle the camera): once an AutoMyco
+  # camera is up, ask it to open its own Home Assistant window. A camera without an API key restarts once
+  # to do it; one that has a key ignores it (camera-public.yaml).
+  - interval: 5s
+    then:
+      - lambda: |-
+          if (!id(camera_api_pending)) return;
+          if (millis() > 300000UL) { id(camera_api_pending) = false; return; }   // no AutoMyco camera came up
+          if (id(cam_link)->open_camera_api()) id(camera_api_pending) = false;
+
+improv_serial:   # the automyco.com flasher sends Wi-Fi over the cable right after installing
+
+esp32_improv:
+  # BLE Wi-Fi setup from a phone (HA app, improv-wifi.com in Chrome). Someone in Bluetooth range
+  # still has to press the rear button to authorise it, so it needs physical presence.
+  authorizer: rear_button
+  authorized_duration: 2min
+
+# Bluetooth only while Improv needs it (1.2.2). Left running, Bluedroid and the BT controller held so much
+# heap that 1.2.0 sat at ~30 KB free (lowest 120 B) and no TLS handshake could start: update checks,
+# recipes and remote access all failed. Now the stack starts only when Improv asks for it: no saved
+# network at power-on, or the saved one has failed for 90 s, while the claim window is open. Once Wi-Fi
+# has been connected for 30 s (or the claim window has closed) it is torn down, and the controller's
+# reserved RAM is handed to the heap. A chamber that already has Wi-Fi never starts Bluetooth at all.
+# Bluetooth then stays off until the next power-on, which is also the only time Improv reopens.
+# Decisions: common/ble_lifecycle.h (tests/test_ble_lifecycle.cpp); ESP-IDF side and numbers: ble_release.h.
+esp32_ble:
+  enable_on_boot: false   # ble_release.h starts it when Improv needs it
+
+# The Pair window (docs/setup-simplification.md, changes C and D). Holding the rear button 2-4 s proves
+# someone is at the chamber and, for 2 minutes:
+#   - opens update pairing (below);
+#   - lets Camera Reset Login through (camera_link), besides its 30 min after power-on. The camera then
+#     reboots and opens its own 30-minute claim window, so the app can claim it again. The chamber still
+#     never learns the camera's login;
+#   - lets Reset Cloud Identity through (end of this file; common/cloud-identity.yaml "Token rotation");
+#   - lets set_ota_password through (one password per hold, like update pairing);
+#   - lets UV-C on and the Remote Pairing Code through on a chamber no phone has paired with yet
+#     (common/owner_gate.h; on a paired chamber they need the app's signed key instead);
+#   - lets Open Adoption Window through (end of this file): Home Assistant adoption without unplugging;
+#   - blinks the grow light (Top Light) twice, then puts it back exactly as it was. UV-C is never touched.
+# The Pair window itself doesn't reopen the api provisioning window: ESPHome 2026.9 closes that for good
+# until the next boot (its closed state and the callbacks that stop Improv and drop API clients are
+# internal and one-shot). Open Adoption Window gets there with one restart instead (adopt_window.h).
+#
+# Update pairing: how an owner without Home Assistant gets app updates. The iOS app can only do password
+# OTA, and plaintext OTA stays locked (above) until someone sets a password. Holding the rear button for
+# 2-4 s opens a 2-minute window (physical presence, like BLE Improv). During that window the app writes a
+# random password it made to the Update Pairing text over the LAN API, keeps it in the iOS Keychain, and
+# uses it for every later update. One password per hold: the window closes as soon as one is accepted.
+# The chamber then publishes a fingerprint of the password it stored (update_pairing.h). The app only
+# reports success when that matches its own password, so a device that raced it in the window, or a window
+# that timed out, shows up as a failed pairing instead of a silent one.
+# Known limit: the password crosses the LAN once, in cleartext (HTTP query string), when it's written.
+# Anyone on the LAN can already drive the chamber over the same API; OTA itself never sends the password.
+# Short presses (light) and the 5 s hold (self-test) are unchanged.
+binary_sensor:
+  - id: !extend rear_button
+    on_click:
+      - min_length: 2s
+        max_length: 4s
+        then:
+          - lambda: |-
+              id(ota_pair_until) = (millis() + 120000) | 1;   // | 1: never 0, which means "closed"
+              id(update_pairing_fingerprint).publish_state("");   // cleared until a password is accepted
+              id(cam_link)->open_pair_window(120000);   // Camera Reset Login accepted for 2 min
+          - script.execute: pair_blink
+          - script.execute: { id: log_event, msg: "pair window open (2 min): update pairing, camera login reset" }
+  - platform: template
+    id: update_pairing_open
+    name: Update Pairing Open
+    icon: mdi:link-variant
+    entity_category: diagnostic
+    lambda: |-
+      return id(ota_pair_until) != 0 && (int32_t) (id(ota_pair_until) - millis()) > 0;
+
+text:
+  - platform: template
+    id: update_pairing
+    name: Update Pairing
+    icon: mdi:key-link
+    entity_category: config
+    mode: password
+    min_length: 0
+    max_length: 64
+    optimistic: false   # never reports the password back: the state stays empty
+    set_action:
+      - lambda: |-
+          const bool open = id(ota_pair_until) != 0 && (int32_t) (id(ota_pair_until) - millis()) > 0;
+          if (!open) {
+            ESP_LOGW("security", "update pairing refused: hold the rear button 2-4 s first");
+            return;
+          }
+          if (x.size() < 12 || x.size() > 64) {
+            ESP_LOGW("security", "update pairing refused: use 12 to 64 characters");
+            return;
+          }
+          id(ota_pair_until) = 0;
+          id(owner_ota_password).fill(0);
+          x.copy(id(owner_ota_password).data(), x.size());
+          ts_persist_now(owner_ota_password);   // the app keeps using it: a power cut mustn't lose it
+          id(ota_main)->set_auth_password(x);
+          id(update_pairing_fingerprint).publish_state(ts01_pair_fingerprint(x));
+          id(log_event).execute("OTA password set by update pairing");
+          id(guard)->set_owner_password(x);   // UV-C on / Camera Reset Login now need X-AutoMyco-Key
+      - script.execute: clear_pairing_fingerprint
+
+text_sensor:
+  - platform: template
+    id: control_challenge
+    name: Control Challenge
+    icon: mdi:dice-multiple
+    entity_category: diagnostic
+    update_interval: never   # published by web_guard: at boot, on a password change, after each accepted key
+  - platform: template
+    id: update_pairing_fingerprint
+    name: Update Pairing Fingerprint
+    icon: mdi:fingerprint
+    entity_category: diagnostic
+    update_interval: never   # published by the rear-button hold (cleared) and the Update Pairing text
+    on_value:
+      # A phone just paired at the chamber (the fingerprint is only ever published non-empty when the
+      # Update Pairing text was accepted in the Pair window): replace the cloud token as well, so a copy a
+      # previous owner read out of flash stops working (common/cloud-identity.yaml "Token rotation").
+      - lambda: |-
+          if (!x.empty()) id(cloud_rotate_start).execute("update pairing", ts_rotation::REASON_UPDATE_PAIR);
+
+# Reset Cloud Identity: replaces the cloud token (the Cloud Device ID stays) for someone who bought the
+# chamber second-hand and wants to be sure the previous owner's copy is dead, without pairing anything.
+# Only during the rear-button Pair window (hold 2-4 s), so nothing on the LAN can press it alone.
+button:
+  - platform: template
+    id: reset_cloud_identity
+    name: Reset Cloud Identity
+    icon: mdi:shield-refresh-outline
+    entity_category: config
+    on_press:
+      - lambda: |-
+          if (!owner_gate::present()) {
+            ESP_LOGW("security", "Reset Cloud Identity refused: hold the rear button 2-4 s first");
+            id(cloud_identity_status).publish_state("Hold the rear button 2-4 s, then press Reset again");
+            return;
+          }
+          // "reason":"reset" on the rotation: the server also drops this chamber's push subscriptions, so a
+          // previous owner's phone stops getting its alerts (common/cloud-identity.yaml).
+          id(cloud_rotate_start).execute("Reset Cloud Identity", ts_rotation::REASON_RESET);
+  # Home Assistant adoption without unplugging the chamber. Only inside the rear-button Pair window. With no
+  # API key yet, the chamber restarts and its provisioning window is open for ${provisioning_window}
+  # (adopt_window.h); either way an AutoMyco camera is asked to restart with its own window open, so HA can
+  # adopt it too (camera-public.yaml). With an API key already set, the chamber doesn't restart: HA just
+  # connects with that key.
+  - platform: template
+    id: open_adoption_window
+    name: Open Adoption Window
+    icon: mdi:home-assistant
+    entity_category: config
+    on_press:
+      - lambda: |-
+          if (!owner_gate::present()) {
+            ESP_LOGW("security", "Open Adoption Window refused: hold the rear button 2-4 s first");
+            id(log_event).execute("adoption window refused: hold the rear button 2-4 s first");
+            return;
+          }
+          id(ota_pair_until) = 0;   // one use per hold
+          if (api::global_api_server->get_noise_ctx().has_psk()) {
+            const bool cam = id(cam_link)->open_camera_api();
+            id(log_event).execute(cam ? "adoption: chamber already has an API key; camera window opening"
+                                      : "adoption: chamber already has an API key");
+            return;
+          }
+          id(log_event).execute("adoption window: restarting with it open");
+          ts_adopt::arm();
+      - delay: 1s   # the event log line and the web answer go out first
+      - lambda: |-
+          if (ts_adopt::armed()) App.safe_reboot();

@@ -1,0 +1,2688 @@
+# Terrashroom TS-01 replacement firmware (main control board "V1.5 JWE", ESP32-WROOM-32E, 4MB): the
+# shared core. Everything except the network credentials lives here, so every build gets the same
+# controller and the same interlocks. Don't compile this file directly. Build one of:
+#   terrashroom.yaml         the personal build: Wi-Fi, API key and OTA password from secrets.yaml
+#   terrashroom-public.yaml  the public build: no credentials, each chamber is set up on first boot
+# Pin map: docs/hardware.md. App-facing entities: docs/device-api.md. Keep the names in sync with that contract.
+#
+# Safety rules baked in:
+#  - UV-C (GPIO18) is OFF at every boot and only turns on when a person switches UV-C Lamp on. It turns
+#    itself off after UV-C Auto-Off minutes (1-60), after 60 lit minutes in any 24 hours (common/uvc_budget.h),
+#    on low water (as stock did), when an OTA upload starts and before the self-test. Pressing it again
+#    never extends a run. With the opt-in lid reed (common/lid-interlock.yaml) it is refused and cut
+#    whenever the lid isn't proven shut.
+#  - The heater switches off on a sensor fault, a stale reading, or temperatures above max_safe_temp_f.
+#  - The atomizer locks out while the water level is low.
+#  - Load checks (common/load_check.h) never run a load just to test it, apart from the self-test, which
+#    runs at boot unless Boot Self-Test is off. The self-test never touches UV-C except to switch it off.
+
+substitutions:
+  name: automyco             # network name: automyco-a1b2c3 (was terrashroom-a1b2c3 before 2026-10-09)
+  friendly_name: AutoMyco
+  max_safe_temp_f: "88"     # hard heater cut-off
+  stale_sensor_s: "60"      # treat the HDC1080 as failed if it hasn't updated in this long
+  resume_max_outage_h: "72" # power off longer than this: come back with the grow paused, not running
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  name_add_mac_suffix: true   # automyco-a1b2c3.local
+  project:
+    name: community.terrashroom-ts01
+    version: "1.2.7"
+  includes:
+    - common/load_check.h   # the "is this load plugged in?" rules shared by the self-test and the watcher
+    - common/resume_math.h  # resume or pause after a power cut
+    - self_test_math.h      # the self-test's bracketed measurement, spread check and OK/FAIL/UNSURE verdict
+    - common/persist_now.h  # ts_persist_now(): write restored globals to flash now (sync() alone doesn't)
+    - common/time_source.h  # the Time Source diagnostic: sntp / held / rtc / none
+    - common/mist_cycle.h   # the humidify cycle's clock: wrap-safe elapsed(), phases, the mist pulser
+    - common/grow_climate.h # species presets, the humidity target per phase, the mist-start band
+    - common/uvc_budget.h   # UV-C: at most 60 lit minutes in any 24 hours, kept across reboots
+    - common/owner_gate.h   # who may switch UV-C on (the public build sets it: paired phone or Pair window)
+  # A clean reboot (OTA update, Restart button) stamps last_alive on its way down. The trigger (priority
+  # 600) runs before the globals (800) store it and the preferences syncer (1000) writes it to flash. A crash
+  # or watchdog skips this, and resume_math tells those from power cuts by the reset reason anyway.
+  on_shutdown:
+    - lambda: |-
+        auto now = id(sntp_time).now();
+        if (now.is_valid()) id(last_alive) = now.timestamp;
+  on_boot:   # a list, so a build that includes this file can add its own on_boot entries
+    - priority: -100
+      then:
+        - lambda: |-
+            // Apply the restored preset's setpoints only if the numbers were never set.
+            if (isnan(id(humidity_setpoint).state)) id(humidity_setpoint).publish_state(88);
+            if (isnan(id(temperature_setpoint).state)) id(temperature_setpoint).publish_state(70);
+            // The saved Atomizer Power, before any mist pulse can start.
+            const float ap = id(atomizer_power).state;
+            id(atomizer_pwm).set_max_power(isnan(ap) ? 1.0f : ap / 100.0f);
+            // The Tank Empty Alert comes back with the Hard Stop it engaged (both saved), so Low Water
+            // is true again after a reboot with an empty tank in Humidity Response mode.
+            if (id(tank_empty) && id(atomizer_hard_stop).state) id(tank_empty_alert).publish_state(true);
+            else id(tank_empty) = false;
+            id(booted) = true;
+            id(firmware_version).publish_state(ESPHOME_PROJECT_VERSION);   // apps compare this with releases
+            id(event_log).publish_state(std::string(id(evlog).data(), strnlen(id(evlog).data(), id(evlog).size())));
+            id(log_event).execute("boot");
+            // Resume after a power cut: keep when the chamber was last alive, then clear it, so a run that
+            // never gets the time (no internet) leaves "unknown" behind rather than a stale timestamp.
+            id(prev_alive) = id(last_alive);
+            id(last_alive) = 0;
+            uvc_budget::g_store.begin(millis());   // the UV-C ledger from flash (checked), uptime clock starts
+    # Boot self-test: once the current and temperature readings are in (Wi-Fi and the API don't matter),
+    # run the self-test once so the "Not Detected" sensors mean something from the start.
+    - priority: -200
+      then:
+        - delay: 20s   # restored lights finish their transitions; first INA219 and HDC1080 readings in
+        - wait_until:
+            condition:
+              lambda: return id(load_current).has_state() && id(temperature).has_state();
+            timeout: 60s   # no temperature by then: the heater step is skipped, the rest still runs
+        # A quiet rail first: 90 s of uptime, and the camera (restored on ~10 s after boot) either said
+        # ready or is off. A booting camera's draw moves by more than the blower's +6 mA, which is how the
+        # 2026-10-09 boot self-test read the running blower at -2 mA. 180 s at the most: the owner's
+        # camera, on an older build, never sends a ready line.
+        - wait_until:
+            condition:
+              lambda: |-
+                return millis() >= 90000UL &&
+                       (id(cam_link)->camera_ready() || !id(camera_power).state || millis() >= 180000UL);
+            timeout: 200s
+        - if:
+            condition:
+              switch.is_on: boot_self_test
+            then:
+              - lambda: id(st_boot) = true;
+              - script.execute: self_test
+
+esp32:
+  board: esp32dev
+  flash_size: 4MB
+  framework:
+    type: arduino
+
+logger:
+  baud_rate: 115200   # UART0 on header pins 4/5, same as the stock debug port
+
+# No HTTP auth: the iOS app speaks the unauthenticated LAN API in docs/device-api.md.
+# Any device on the LAN can control the chamber, though the heater/UV-C interlocks still apply. UV-C on is
+# the exception in the public build: once a phone has paired it needs the app's signed X-AutoMyco-Key
+# (web_guard keyed_entities), and before that the rear-button Pair window (common/owner_gate.h). In every
+# build the auto-off cap, the 60-minutes-a-day budget and the low-water cut still apply.
+# Web pages can't: web_guard (below) blocks cross-site and DNS-rebinding requests.
+# Firmware upload over HTTP is disabled. /update only works while the fallback AP's
+# captive portal is active (no Wi-Fi). Normal updates use the native OTA
+# (`ota: platform: esphome`). Each build sets up its own AP, API and OTA protection.
+# web_guard sits in front of web_server (docs/device-api.md "Security"). Without it, any web page
+# open on the LAN could drive the chamber: ESPHome runs actions on GET (an <img> could switch UV-C
+# on), sends `Access-Control-Allow-Origin: *` and has no Host check (DNS rebinding). The guard refuses
+# foreign Hosts, cross-origin requests, CORS preflights, GET actions, and POSTs carrying neither a
+# same-origin Origin (the dashboard) nor X-Requested-With (the app). The LAN API stays
+# unauthenticated by design, so require_auth is off.
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [web_guard, chamber_history]
+
+web_guard:
+  require_auth: false
+
+# Climate history kept on the chamber (components/chamber_history, docs/device-api.md "Climate history"):
+# one record per 5 minutes in a flash partition nothing else uses, served at GET /history?since=<epoch>, so
+# the app's charts fill in over the LAN with or without the cloud. ~180 days on chambers installed over the
+# stock firmware (its 512 KiB 'storage' partition), ~20 days on chambers flashed over USB (ESPHome's 60 KiB
+# 'spiffs'). Any other partition table: history stays off. Read-only over HTTP, like every other GET.
+chamber_history:
+  time_id: sntp_time
+  temperature: temperature
+  humidity: humidity
+  temperature_setpoint: temperature_setpoint
+  humidity_setpoint: humidity_setpoint
+  heater_duty: |-
+    return id(heater).state ? id(heater_level) : 0.0f;
+  mist_duty: |-
+    return id(atomizer).state ? 1.0f : 0.0f;
+  phase: |-
+    if (!id(climate_control).state) return 0;
+    const auto index = id(grow_phase).active_index();
+    return index.has_value() ? (uint8_t) (*index + 1) : 0;
+
+web_server:
+  port: 80
+  version: 3
+  ota: false
+  # Our own dashboard (web UI overhaul, phase 2), styled like the iOS app: web/dashboard.js is
+  # embedded (gzipped) and served as /0.js, so the page works with no internet. `local: true` would
+  # serve ESPHome's bundled page, which ignores js_include, and an empty js_url keeps the stock
+  # page from loading from oi.esphome.io. The dashboard has an "All entities" list as a fallback.
+  js_include: web/dashboard.js
+  js_url: ""
+  # Sections for the stock UI (phase 1). Unused by the dashboard; kept so switching back is one line.
+  sorting_groups:
+    - id: grp_grow
+      name: "Grow"
+      sorting_weight: 10
+    - id: grp_lights
+      name: "Lights"
+      sorting_weight: 20
+    - id: grp_air
+      name: "Air"
+      sorting_weight: 30
+    - id: grp_water
+      name: "Water & Mist"
+      sorting_weight: 40
+    - id: grp_heat
+      name: "Heater"
+      sorting_weight: 50
+    - id: grp_health
+      name: "Power & Health"
+      sorting_weight: 60
+    - id: grp_uvc
+      name: "UV-C (eye hazard)"
+      sorting_weight: 55
+    - id: grp_maint
+      name: "Maintenance (bench)"
+      sorting_weight: 90
+
+# Wall-clock time (docs/time-and-schedule.md). After one SNTP sync the ESP32 keeps the clock running from its
+# crystal through any later internet outage (Time Source: held), and through a software restart (RTC timer),
+# so the light schedule, Grow Day and the phase timer carry on. Only a power-on with no internet leaves the
+# chamber without a clock, unless the optional DS3231 package (common/rtc-ds3231.yaml) is fitted. Nothing
+# safety-related reads the wall clock: heater cut-offs, UV-C auto-off and the low-water lockout use millis().
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: America/New_York   # set to your timezone (the light schedule depends on this)
+    on_time_sync:   # every successful poll (15 min)
+      - lambda: id(time_synced_at) = time_source::stamp(millis());
+
+globals:
+  - id: camera_off_at         # millis() when camera power last went off (boot counts as off)
+    type: uint32_t
+    initial_value: "0"
+  - id: auto_writing          # true while the controller itself drives an entity
+    type: bool
+    initial_value: "false"
+  - id: last_climate_update   # millis() of the last good HDC1080 reading
+    type: uint32_t
+    initial_value: "0"
+  - id: low_water_count       # consecutive dry probe readings (debounce). Starts at the alarm level, so the
+    type: int                 # probe fails closed: Low Water is ON until three wet readings in a row clear it.
+    initial_value: "8"
+  - id: wet_count             # consecutive wet probe readings; three clear the low-water count
+    type: int
+    initial_value: "0"
+  - id: atomizer_off_at       # millis() the atomizer last switched off (probe reads skip for 3 s after)
+    type: uint32_t
+    initial_value: "0"
+  - id: uv_lid_ok             # false = UV-C Lamp refuses to turn on. Nothing in this file changes it; the opt-in
+    type: bool                # lid reed package (common/lid-interlock.yaml) holds it false while the lid is open.
+    initial_value: "true"
+  - id: level_sensor_dry      # the opt-in level sensor's verdict (common/water-level-sensor.yaml). Starts true
+    type: bool                # and nothing here clears it, so a Water Sensing mode without its package locks out.
+    initial_value: "true"
+  - id: tank_empty            # Tank Empty Alert, kept across reboots with the Hard Stop it engaged
+    type: bool
+    restore_value: true
+    initial_value: "false"
+  - id: fresh_air_until       # millis() when the current fresh-air burst ends
+    type: uint32_t
+    initial_value: "0"
+  - id: next_fresh_air        # millis() when the next fresh-air burst starts
+    type: uint32_t
+    initial_value: "0"
+  - id: booted                # false until on_boot runs, so a restored preset can't overwrite tuned setpoints
+    type: bool
+    initial_value: "false"
+  - id: applying_preset       # true while a preset writes the setpoints
+    type: bool
+    initial_value: "false"
+  - id: hdc_heating           # true during an HDC1080 dry pulse + cool-down: readings are discarded
+    type: bool
+    initial_value: "false"
+  - id: rh_high_since         # millis() since RH has been >= 95 % (0 = not high)
+    type: uint32_t
+    initial_value: "0"
+  - id: last_dry_pulse        # millis() of the last dry pulse (0 = never)
+    type: uint32_t
+    initial_value: "0"
+  - id: mist_since            # millis() when the atomizer last turned on continuously (0 = off)
+    type: uint32_t
+    initial_value: "0"
+  - id: hum_cycle_start       # millis() start of the current humidify cycle (0 = none; stored | 1 so it's never 0)
+    type: uint32_t
+    initial_value: "0"
+  - id: mist_phase            # true while the controller is in a cycle's mist phase: the 250 ms pulser runs the atomizer
+    type: bool
+    initial_value: "false"
+  - id: last_fresh_air        # millis() the last fresh-air exchange started (0 = none; stored | 1)
+    type: uint32_t
+    initial_value: "0"
+  - id: heat_full_since       # millis() the heater went to 100 % (0 = not at 100 %; stored | 1)
+    type: uint32_t
+    initial_value: "0"
+  - id: heat_full_temp        # temperature when the heater went to 100 %, for the stall check
+    type: float
+    initial_value: "0"
+  - id: preset_auto_custom    # true while a setpoint nudge switches Grow Preset to Custom (keeps idle airflow)
+    type: bool
+    initial_value: "false"
+  # Self-test: what the loads were doing before the test, put back afterwards when Climate Control is off
+  # (with it on, the controller re-drives everything itself).
+  - id: st_restore            # true when the snapshot below is to be restored after the test
+    type: bool
+    initial_value: "false"
+  - id: st_fan_speeds         # Fan 1, Fan 2, Blower speed before the test (0 = off)
+    type: std::array<int, 3>
+    initial_value: 'std::array<int, 3>{}'
+  - id: st_atomizer_was_on
+    type: bool
+    initial_value: "false"
+  - id: st_heater_was_on
+    type: bool
+    initial_value: "false"
+  - id: purging               # over-humidity purge latched (> 98 % until <= 89 %)
+    type: bool
+    initial_value: "false"
+  - id: dry_since             # millis() drying started (0 = not drying)
+    type: uint32_t
+    initial_value: "0"
+  - id: heat_since            # millis() the current heating run started (0 = not heating)
+    type: uint32_t
+    initial_value: "0"
+  - id: soft_lock             # RH soft ceiling latched (Hackshroom idea): no new moisture until release
+    type: bool
+    initial_value: "false"
+  - id: soft_since            # millis() RH first exceeded the soft ceiling (0 = below)
+    type: uint32_t
+    initial_value: "0"
+  - id: evlog                 # recent events, newest first, kept across reboots
+    type: std::array<char, 600>
+    restore_value: true
+    initial_value: 'std::array<char, 600>{}'
+  - id: grow_start            # UTC epoch seconds when the current grow started (0 = no grow)
+    type: uint32_t
+    restore_value: true
+    initial_value: "0"
+  # Grow phases (docs/grow-phases.md). Epoch seconds, saved so a reboot doesn't restart the phase clock.
+  - id: phase_start           # when the current Grow Phase began (0 = not yet known; set at the next valid time)
+    type: uint32_t
+    restore_value: true
+    initial_value: "0"
+  - id: phase_snooze_until    # "Not Yet" pressed: no phase question before this time
+    type: uint32_t
+    restore_value: true
+    initial_value: "0"
+  - id: camera_stage_at       # when Camera Stage was last set (0 = no usable observation)
+    type: uint32_t
+    restore_value: true
+    initial_value: "0"
+  - id: phase_next            # the phase the open question proposes ("" = no question)
+    type: std::string
+    initial_value: '""'
+  - id: idle_airflow          # stock per-species idle fan duty X (Fan1 = X, Fan2 = X+1, out of 255)
+    type: int
+    restore_value: true
+    initial_value: "7"
+  # The species' pinning RH kept while Grow Preset is Custom (a setpoint hand edit or a cloud recipe put it
+  # there); 0 = no species known, so Pinning uses the old setpoint + 3. With a species selected the preset's
+  # own value is used and this is ignored (common/grow_climate.h pinning_rh_for). Restored by name hash, so
+  # adding it moves no other saved value; a chamber updated from 1.2.6 starts at 0.
+  - id: species_pinning_rh
+    type: float
+    restore_value: true
+    initial_value: "0"
+  - id: light_sched_on        # last state the light schedule applied (1 on, 0 off, -1 none yet)
+    type: int
+    restore_value: true
+    initial_value: "-1"
+  - id: mist_demand           # controller wants more humidity this tick (spans burst pauses)
+    type: bool
+    initial_value: "false"
+  - id: mist_rh_start         # RH at the start of the current 5-min misting window
+    type: float
+    initial_value: "0"
+  - id: fae_cycle             # counts fresh-air exchanges, used by Alternate mode
+    type: uint32_t
+    initial_value: "0"
+  # Self-test readings and brackets live in self_test_math::session() (self_test_math.h).
+  - id: st_report             # self-test: accumulated result text
+    type: std::string
+    initial_value: '""'
+  - id: st_missing            # self-test: labels of the loads that failed, for the event log
+    type: std::string
+    initial_value: '""'
+  - id: st_skip               # self-test: why the current load is skipped ("" = test it)
+    type: std::string
+    initial_value: '""'
+  - id: st_boot               # self-test: started by the boot self-test (event log wording)
+    type: bool
+    initial_value: "false"
+  - id: heater_level          # heater PWM level used when the Heater switch is on (manual = full)
+    type: float
+    initial_value: "1.0"
+  # Airflow-while-heating interlock: when it raises the blower it remembers what the blower was doing, so
+  # the blower goes back to that when the heater stops. Any other blower change (a person, the controller,
+  # the self-test) clears blower_raised: that new setting is then the one to keep.
+  - id: blower_raised         # true while the blower runs at 30 % only because the interlock raised it
+    type: bool
+    initial_value: "false"
+  - id: blower_raising        # true while the interlock itself writes the blower
+    type: bool
+    initial_value: "false"
+  - id: blower_was_on         # blower state before the interlock raised it
+    type: bool
+    initial_value: "false"
+  - id: blower_was_speed      # blower speed before the interlock raised it
+    type: int
+    initial_value: "0"
+
+  # Resume after a power cut (docs/setup-simplification.md, section 3a). Climate Control and the grow are
+  # saved, so a chamber that was growing comes back growing. After a long outage it comes back paused.
+  - id: last_alive            # UTC epoch seconds, saved every 15 min while the clock is valid and at a clean
+                              # shutdown (0 = unknown)
+    type: uint32_t
+    restore_value: true
+    initial_value: "0"
+  - id: prev_alive            # last_alive as it was at boot (0 = unknown: first boot, or no clock last run)
+    type: uint32_t
+    initial_value: "0"
+  - id: time_synced_at        # time_source::stamp(millis()) of the last SNTP sync (0 = none since boot)
+    type: uint32_t
+    initial_value: "0"
+  - id: time_from_rtc         # the DS3231 package set the clock at this boot
+    type: bool
+    initial_value: "false"
+  - id: grow_paused           # true while a long outage holds Climate Control off; cleared by turning it on
+    type: bool
+    restore_value: true
+    initial_value: "false"
+
+  - id: uv_off_at             # millis() hard auto-off deadline for the UV-C lamp (0 = lamp off)
+    type: uint32_t
+    initial_value: "0"
+
+i2c:
+  id: i2c_bus
+  sda: GPIO21
+  scl: GPIO22
+  scan: true   # logs every I2C address at boot: HDC1080 0x40, current sensor 0x45, SCD41 0x62 if fitted
+  frequency: 100kHz
+
+# ---------------------------------------------------------------- outputs
+output:
+  - platform: ledc        # stock: ch2, 10 kHz
+    id: fan1_pwm
+    pin: GPIO32
+    frequency: 10000Hz
+  - platform: ledc        # stock: ch3, 10 kHz
+    id: fan2_pwm
+    pin: GPIO33
+    frequency: 10000Hz
+  - platform: ledc        # stock: ch4, 10 kHz
+    id: blower_pwm
+    pin: GPIO25
+    frequency: 10000Hz
+  - platform: ledc        # stock: ch5, 10 kHz
+    id: atomizer_pwm
+    pin: GPIO13
+    frequency: 10000Hz
+    max_power: 100%       # enables runtime scaling; Atomizer Power sets the real value at boot
+  - platform: ledc        # stock: ch6, 400 Hz 12-bit. GPIO12 is a strapping pin, so it stays low at boot.
+    id: heater_pwm
+    pin: GPIO12
+    frequency: 400Hz
+  - platform: gpio        # water-level probe excitation
+    id: water_probe_drive
+    pin: GPIO15
+
+# ---------------------------------------------------------------- climate sensor
+sensor:
+  - platform: hdc1080
+    id: hdc
+    temperature:
+      id: temperature
+      name: Temperature
+      web_server:
+        sorting_group_id: grp_grow
+        sorting_weight: 4
+      unit_of_measurement: "°F"
+      accuracy_decimals: 1
+      filters:
+        - lambda: |-
+            if (id(hdc_heating)) return {};   // sensor heater on or cooling: reading is not chamber air
+            return x * 1.8f + 32.0f;
+      on_value:
+        - lambda: id(last_climate_update) = millis();
+    humidity:
+      id: humidity
+      name: Humidity
+      web_server:
+        sorting_group_id: grp_grow
+        sorting_weight: 5
+      accuracy_decimals: 1
+      filters:
+        - lambda: |-
+            if (id(hdc_heating)) return {};
+            return x;
+    update_interval: 10s
+
+  # Stock "electricity" module: INA219 at 0x45 (confirmed 2026-10-03: config reg 0x399F, bus 23.9 V).
+  # Shunt 0.01 ohm (inferred from load): with 0.1 ohm, both fans running at 100% (seen and heard) read
+  # only 10 mA total; 0.01 ohm gives ~50 mA (~1.2 W) per 24 V 80 mm fan, which is plausible.
+  - platform: ina219
+    id: ina                 # update() = a one-shot reading, used by the load checks
+    address: 0x45
+    shunt_resistance: 0.01 ohm
+    max_voltage: 32V
+    max_current: 10A
+    update_interval: 2s
+    bus_voltage:
+      id: load_bus_voltage
+      name: Supply Voltage
+      web_server:
+        sorting_group_id: grp_health
+        sorting_weight: 1
+    current:
+      id: load_current
+      name: Load Current
+      web_server:
+        sorting_group_id: grp_health
+        sorting_weight: 2
+      accuracy_decimals: 3
+      on_value:
+        - lambda: load_check::watcher().sample(x, millis());
+    power:
+      id: load_power
+      name: Load Power
+      web_server:
+        sorting_group_id: grp_health
+        sorting_weight: 3
+
+  - platform: template
+    id: last_outage
+    name: Last Power Outage   # best estimate (+/- 8 min) of the minutes the power was off before this boot;
+                              # unknown without the clock, and after a restart (the power never went off)
+    icon: mdi:power-plug-off-outline
+    unit_of_measurement: min
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: never
+    web_server:
+      sorting_group_id: grp_health
+      sorting_weight: 8
+
+  - platform: template
+    id: grow_day
+    name: Grow Day
+    icon: mdi:calendar-today
+    accuracy_decimals: 0
+    update_interval: 60s
+    lambda: |-
+      auto now = id(sntp_time).now();
+      if (id(grow_start) == 0 || !now.is_valid()) return NAN;
+      return (float) ((now.timestamp - id(grow_start)) / 86400 + 1);
+    web_server:
+      sorting_group_id: grp_grow
+      sorting_weight: 0
+
+  - platform: template
+    id: phase_day
+    name: Phase Day
+    icon: mdi:calendar-start
+    accuracy_decimals: 0
+    update_interval: 60s
+    lambda: |-
+      auto now = id(sntp_time).now();
+      if (id(grow_start) == 0 || id(phase_start) == 0 || !now.is_valid()) return NAN;
+      return (float) ((now.timestamp - id(phase_start)) / 86400 + 1);
+    web_server:
+      sorting_group_id: grp_grow
+      sorting_weight: 12
+
+  - platform: template
+    id: uvc_remaining
+    name: UV-C Remaining
+    icon: mdi:timer-sand
+    unit_of_measurement: s
+    accuracy_decimals: 0
+    update_interval: never   # published by the 1 s UV-C interval
+    web_server:
+      sorting_group_id: grp_uvc
+      sorting_weight: 2
+
+  - platform: template
+    id: fresh_air_exchanges   # exchanges since boot (scheduled, CO2-triggered and Fresh Air Now); not kept across reboots
+    name: Fresh Air Exchanges
+    icon: mdi:weather-windy
+    accuracy_decimals: 0
+    state_class: total_increasing
+    update_interval: never   # published by the controller at each exchange
+    web_server:
+      sorting_group_id: grp_air
+      sorting_weight: 9
+
+  - platform: wifi_signal
+    name: WiFi Signal
+    web_server:
+      sorting_group_id: grp_health
+      sorting_weight: 4
+    update_interval: 60s
+
+# ---------------------------------------------------------------- water level
+# The stock firmware drives GPIO15 high, waits 3 ms and reads GPIO23 (pulled down).
+# HIGH means the probes are in water. The probe is only energised briefly to limit electrolysis.
+# Low Water is the refill warning apps show, so it follows Water Sensing: the probe in Probe mode,
+# the Tank Empty Alert in Humidity Response mode, the opt-in level sensor or the Tank Empty Alert in Level
+# Sensor mode (common/water-level-sensor.yaml). Water Probe always shows what the probe reads.
+binary_sensor:
+  # On while a long power cut holds Climate Control off (see the resume interval). Turning Climate Control
+  # on resumes; End Grow ends the grow.
+  - platform: template
+    name: Grow Paused
+    icon: mdi:pause-circle-outline
+    lambda: return id(grow_paused);
+    web_server:
+      sorting_group_id: grp_grow
+      sorting_weight: 3
+  - platform: template
+    id: low_water
+    name: Low Water
+    web_server:
+      sorting_group_id: grp_water
+      sorting_weight: 2
+    device_class: problem
+  - platform: template
+    id: water_probe
+    name: Water Probe
+    web_server:
+      sorting_group_id: grp_water
+      sorting_weight: 9
+    entity_category: diagnostic
+    device_class: moisture   # ON = the probe sees water (debounced)
+  - platform: template
+    id: water_probe_raw
+    name: Water Probe Raw
+    web_server:
+      sorting_group_id: grp_water
+      sorting_weight: 10
+    entity_category: diagnostic
+    device_class: moisture   # GPIO23 as read, no debounce: every 2 s, or every 0.5 s during a bench test
+  - platform: template
+    id: tank_empty_alert
+    name: Tank Empty Alert
+    web_server:
+      sorting_group_id: grp_water
+      sorting_weight: 3
+    device_class: problem
+  - platform: template
+    id: phase_check       # ON = the chamber is asking the owner whether to move to the next grow phase
+    name: Phase Check
+    icon: mdi:mushroom-outline
+    web_server:
+      sorting_group_id: grp_grow
+      sorting_weight: 13
+
+  # Load checks: ON = the load was switched on but the 24 V rail didn't see its current, so it's
+  # probably unplugged or broken. Set by the self-test (boot or on demand) and by the passive watcher
+  # (two misses in a row). OFF until a check says otherwise: ESPHome's web API reports a never-set
+  # binary sensor as OFF, so "Connected" sensors would have claimed a fault before any check ran.
+  - platform: template
+    id: fan_1_missing
+    name: Fan 1 Not Detected
+    device_class: problem
+    entity_category: diagnostic
+    web_server:
+      sorting_group_id: grp_health
+      sorting_weight: 10
+  - platform: template
+    id: fan_2_missing
+    name: Fan 2 Not Detected
+    device_class: problem
+    entity_category: diagnostic
+    web_server:
+      sorting_group_id: grp_health
+      sorting_weight: 11
+  - platform: template
+    id: blower_missing
+    name: Blower Not Detected
+    device_class: problem
+    entity_category: diagnostic
+    web_server:
+      sorting_group_id: grp_health
+      sorting_weight: 12
+  - platform: template
+    id: atomizer_missing
+    name: Atomizer Not Detected
+    device_class: problem
+    entity_category: diagnostic
+    web_server:
+      sorting_group_id: grp_health
+      sorting_weight: 13
+  - platform: template
+    id: heater_missing
+    name: Heater Not Detected
+    device_class: problem
+    entity_category: diagnostic
+    web_server:
+      sorting_group_id: grp_health
+      sorting_weight: 14
+  # The controller cut the heater because 45 min at 100 % didn't raise the temperature 0.9 °F (0.5 °C):
+  # a heater that can't keep up, is unplugged, or a door left open. Cleared by a setpoint change or
+  # toggling Climate Control.
+  - platform: template
+    id: heater_stalled
+    name: Heater Stalled
+    device_class: problem
+    icon: mdi:radiator-disabled
+    web_server:
+      sorting_group_id: grp_heat
+      sorting_weight: 8
+
+  - platform: gpio        # rear Bluetooth button (also wired to IO0 for download mode)
+    id: rear_button
+    name: Button
+    internal: true
+    pin:
+      number: GPIO4
+      mode: INPUT_PULLUP
+      inverted: true
+    on_click:
+      - min_length: 50ms
+        max_length: 1s
+        then:
+          - light.toggle: top_light       # short press: grow light on/off
+      - min_length: 5s
+        max_length: 15s
+        then:
+          - script.execute: self_test     # hold 5 s: load self-test (no UV)
+
+interval:
+  # Resume after a power cut. Once the clock is valid: judge the boot (once), then keep last_alive within
+  # 15 min of now (about 100 flash writes a day; on_shutdown adds one per clean reboot). A restart (OTA,
+  # Restart button, crash, watchdog: esp_reset_reason()) never had the power off, so it's logged as
+  # "restarted (software): resumed ..." with no outage and never pauses. After a real power cut the outage is
+  # logged as the range it lies in (last_alive can be up to ~16 min old) and the midpoint goes to Last Power
+  # Outage and the 72 h rule. Up to 72 h off, a chamber that had Climate Control on just carries on (it was
+  # restored on); longer than that, Climate Control goes off and Grow Paused comes on until the owner turns
+  # it back on or ends the grow. A chamber stored for days shouldn't start heating and misting by itself.
+  # No clock within 10 min of boot: no judgement, it resumes.
+  - interval: 10s
+    then:
+      - lambda: |-
+          auto now = id(sntp_time).now();
+          if (!now.is_valid()) return;
+          static bool judged = false;
+          if (!judged) {
+            judged = true;
+            using resume_math::Action;
+            const int reason = (int) esp_reset_reason();
+            const bool restart = resume_math::is_restart(reason);
+            const auto v = resume_math::judge(id(prev_alive), now.timestamp, millis() / 1000,
+                                              id(climate_control).state, ${resume_max_outage_h}, restart);
+            if (!restart && v.action != Action::NONE) id(last_outage).publish_state(v.off_s / 60.0f);
+            const std::string off = restart ? std::string("restarted (") + resume_math::reset_name(reason) + ")"
+                                            : "power was off " + resume_math::outage(v.off_max_s);
+            if (v.action == Action::LOG) {
+              id(log_event).execute(off);
+            } else if (v.action == Action::PAUSE) {
+              id(grow_paused) = true;
+              id(climate_control).turn_off();
+              id(log_event).execute(off + ": paused, turn Climate Control on to resume");
+            } else if (v.action == Action::RESUME) {
+              id(log_event).execute(id(grow_start) == 0 ? off + ": resumed Climate Control"
+                  : off + ": resumed " + id(grow_phase).current_option() + " day " +
+                        to_string((int) ((now.timestamp - id(grow_start)) / 86400 + 1)));
+            }
+          }
+          if (now.timestamp - id(last_alive) >= 900) id(last_alive) = now.timestamp;
+  - interval: 1s   # UV-C hard auto-off, daily budget and countdown. Signed difference, so millis() wrap is harmless.
+    then:
+      - lambda: |-
+          // A refused turn-on: the template switch publishes "on" (optimistic) right after on_turn_on said no,
+          // which overrides the "off" published there. Put the state back; the pin never went on.
+          if (id(uv_lamp).state && id(uv_off_at) == 0) id(uv_lamp).publish_state(false);
+          const bool lit = id(uv_lamp).state && id(uv_off_at) != 0;
+          auto now = id(sntp_time).now();
+          uvc_budget::g_store.tick(millis(), now.is_valid() ? (uint32_t) now.timestamp : 0, lit);
+          if (!lit) return;
+          if (uvc_budget::remaining(uvc_budget::g_store.ledger) == 0) {
+            id(log_event).execute("UV-C off: 60 min in 24 h used");
+            id(uv_lamp).turn_off();
+            return;
+          }
+          const int32_t left_ms = (int32_t) (id(uv_off_at) - millis());
+          if (left_ms <= 0) {
+            id(log_event).execute("UV-C auto-off");
+            id(uv_lamp).turn_off();
+            return;
+          }
+          id(uvc_remaining).publish_state((left_ms + 999) / 1000);
+
+  - interval: 2s   # stock checks the probe every 2 s
+    then:
+      - lambda: |-
+          // During a bench probe test (Water Probe Drive or Pull not stock) the reading never feeds the
+          // debounce: a held drive is read by the 0.5 s interval below, and a bench pull isn't the stock read.
+          // The test fails closed instead: in Probe mode it reports low water (atomizer locked out, UV-C cut)
+          // rather than trusting a reading it can't take. Everything after the read always runs.
+          const bool bench_drive = std::string(id(water_probe_drive_mode).current_option()) != "Pulse (stock)";
+          const std::string pull = id(water_probe_pull).current_option();
+          const bool stock_pull = pull == "Pull-down (stock)";
+          const bool bench = bench_drive || !stock_pull;
+          // No reading while the atomizer runs or for 3 s after it stops: splashes on the probe would read
+          // wet and clear a real low-water count. The counts simply hold until the next read.
+          const bool splashing = id(atomizer).state || (uint32_t) (millis() - id(atomizer_off_at)) < 3000UL;
+          if (!bench_drive && !splashing) {
+            pinMode(23, stock_pull ? INPUT_PULLDOWN : pull == "Pull-up" ? INPUT_PULLUP : INPUT);
+            id(water_probe_drive).turn_on();
+            delay(3);
+            const bool wet = digitalRead(23);
+            id(water_probe_drive).turn_off();
+            if (!id(water_probe_raw).has_state() || id(water_probe_raw).state != wet) id(water_probe_raw).publish_state(wet);
+            if (stock_pull) {
+              // Fails closed: the count starts at the alarm level, one dry reading adds to it, and only three
+              // wet readings in a row (6 s) clear it.
+              if (wet) { if (++id(wet_count) >= 3) { id(low_water_count) = 0; id(wet_count) = 3; } }
+              else { id(wet_count) = 0; id(low_water_count) = std::min(id(low_water_count) + 1, 1000); }
+            }
+          }
+          const bool probe_dry = id(low_water_count) >= 8;   // ~16 s of dry readings before alarming
+          if (!id(water_probe).has_state() || id(water_probe).state == probe_dry) id(water_probe).publish_state(!probe_dry);
+          const std::string ws = id(water_sensing).current_option();
+          const bool use_probe = ws == "Probe";
+          // A mode this file doesn't know (the opt-in level sensor's "Level Sensor", common/water-level-sensor.yaml)
+          // reads level_sensor_dry, which stays true (locked out) unless that package proves there is water.
+          const bool use_level = !use_probe && ws != "Humidity Response";
+          const bool low = (use_probe && (probe_dry || bench)) || (use_level && id(level_sensor_dry)) || id(tank_empty_alert).state;
+          if (!id(low_water).has_state() || id(low_water).state != low) id(low_water).publish_state(low);
+
+          // UV-C: cut the lamp when the reservoir goes low or empty (stock does this too). The auto-off
+          // deadline is enforced by the 1 s interval above.
+          if (id(uv_lamp).state && low) {
+            id(log_event).execute("UV-C cut: reservoir low/empty");
+            id(uv_lamp).turn_off();
+          }
+
+  # Bench probe test: while Water Probe Drive is Held high/low, read GPIO23 every 0.5 s so a meter on
+  # the WATERLEVEL connector and the reading can be compared. Never feeds the lockout.
+  - interval: 500ms
+    then:
+      - lambda: |-
+          if (std::string(id(water_probe_drive_mode).current_option()) == "Pulse (stock)") return;
+          const std::string pull = id(water_probe_pull).current_option();
+          pinMode(23, pull == "Pull-down (stock)" ? INPUT_PULLDOWN : pull == "Pull-up" ? INPUT_PULLUP : INPUT);
+          const bool wet = digitalRead(23);
+          if (!id(water_probe_raw).has_state() || id(water_probe_raw).state != wet) id(water_probe_raw).publish_state(wet);
+
+  # The grow controller (v2, tuned from the stock firmware's control loop; analysis/stock-control-loop.md).
+  # Runs every 1 s like stock; automation only acts while Climate Control is on.
+  - interval: 1s
+    then:
+      - lambda: |-
+          const uint32_t now = millis();
+          const float t = id(temperature).state, h = id(humidity).state;
+          // During a dry pulse the sensor publishes nothing by design, so it is not "stale"; the controller
+          // pauses instead (below).
+          const bool stale = !id(hdc_heating) && (uint32_t) (now - id(last_climate_update)) > ${stale_sensor_s} * 1000UL;
+          const bool sensor_bad = isnan(t) || isnan(h) || stale;
+
+          // Auto dry pulse: RH >= 95 % for 30 min saturates the HDC1080; dry it at most every 6 h.
+          // Not while the self-test runs: the pulse blanks the temperature, which cuts the heater step.
+          if (!id(hdc_heating) && !isnan(h) && h >= 95.0f) {
+            if (id(rh_high_since) == 0) id(rh_high_since) = now;
+            const bool due = id(last_dry_pulse) == 0 || (uint32_t) (now - id(last_dry_pulse)) > 6UL * 3600000UL;   // last_dry_pulse is stored | 1
+            if ((uint32_t) (now - id(rh_high_since)) > 30UL * 60000UL && due && !id(self_test).is_running())
+              id(hdc_dry_pulse).execute();
+          } else if (!isnan(h) && h < 95.0f) {
+            id(rh_high_since) = 0;
+          }
+
+          // Safety interlocks always apply, even in manual mode.
+          if (sensor_bad || id(hdc_heating) || t > ${max_safe_temp_f}) {
+            if (id(heater).state) { id(auto_writing) = true; id(heater).turn_off(); id(auto_writing) = false; }
+            id(heat_since) = 0;   // a cut run restarts at the gentle 22 % stage
+          }
+          // Airflow while heating (Hackshroom): a running heater always gets at least 30 % blower. The
+          // heater's on_turn_off puts the blower back afterwards (blower_raised). A blower the load check
+          // couldn't find is still asked for; the heater itself is capped at 22 % below.
+          if (id(heater).state && (!id(blower).state || id(blower).speed < 30)) {
+            const bool was_on = id(blower).state; const int was_speed = id(blower).speed;
+            id(auto_writing) = true; id(blower_raising) = true;
+            id(blower).turn_on().set_speed(30).perform();
+            id(blower_raising) = false; id(auto_writing) = false;
+            id(blower_was_on) = was_on; id(blower_was_speed) = was_speed; id(blower_raised) = true;
+          }
+          const bool water_lockout = (id(low_water).state && !id(water_lockout_override).state) || id(atomizer_hard_stop).state;
+          if (water_lockout && id(atomizer).state) {
+            id(auto_writing) = true; id(atomizer).turn_off(); id(auto_writing) = false;
+          }
+
+          // Humidity Response water sensing (for when the probe can't be trusted): if 5 min of continuous
+          // misting raises RH by < 1.5 %, assume the tank is empty, engage the Hard Stop (saved to flash)
+          // and raise the Tank Empty Alert. Each successful 5-min window starts a new one.
+          // Misting is "active" while the controller wants humidity (bursts + pauses count as one run),
+          // or while the atomizer is on in manual mode. Runs in every mode but Probe, so it also backs up the
+          // opt-in level sensor (which can't tell a sensor stuck at "water" from a full tank).
+          const bool misting_run = id(mist_demand) || (id(atomizer).state && !id(climate_control).state);
+          if (std::string(id(water_sensing).current_option()) != "Probe" && misting_run
+              && !id(hdc_heating) && !isnan(h)) {
+            if (id(mist_since) == 0) { id(mist_since) = now; id(mist_rh_start) = h; }
+            else if ((uint32_t) (now - id(mist_since)) > 5UL * 60000UL) {
+              if (h - id(mist_rh_start) < 1.5f) {
+                ESP_LOGW("water", "5 min of misting raised RH by only %.1f %% -> tank empty? Hard Stop engaged",
+                         h - id(mist_rh_start));
+                id(atomizer_hard_stop).turn_on();
+                id(tank_empty) = true;   // saved with the Hard Stop, so the alert survives a reboot
+                id(tank_empty_alert).publish_state(true);
+                id(log_event).execute("tank empty? atomizer hard stop engaged");
+                id(mist_since) = 0;
+              } else {
+                id(mist_since) = now; id(mist_rh_start) = h;
+              }
+            }
+          } else if (!misting_run) {
+            id(mist_since) = 0;
+          }
+
+          std::string state = "paused";
+          id(mist_demand) = false;
+          // The self-test switches loads itself, so the controller sits out while it runs (Climate
+          // Control keeps its setting and takes over again afterwards). The interlocks above still apply.
+          const bool self_testing = id(self_test).is_running();
+          if (id(climate_control).state && !self_testing) {
+            auto set_switch = [&](switch_::Switch *s, bool on) {
+              if (s->state != on) { id(auto_writing) = true; on ? s->turn_on() : s->turn_off(); id(auto_writing) = false; }
+            };
+            auto set_fan = [&](fan::Fan *f, int speed) {
+              if (f->state == (speed > 0) && (speed == 0 || f->speed == speed)) return;
+              id(auto_writing) = true;
+              if (speed > 0) f->turn_on().set_speed(speed).perform(); else f->turn_off().perform();
+              id(auto_writing) = false;
+            };
+
+            // Grow phase (docs/grow-phases.md): Fruiting runs the setpoints as they are. Incubation adds no
+            // moisture, holds Incubation Temperature and keeps fresh air sparse (lights stay off, see the
+            // schedule below). Pinning raises RH to the species' pinning RH (common/grow_climate.h: max(setpoint,
+            // species value), capped at 94 %; setpoint + 3 with no species) and doubles fresh air to trigger pins.
+            const std::string phase = id(grow_phase).current_option();
+            const bool incubating = phase == "Incubation", pinning = phase == "Pinning";
+            float fae_min = id(fresh_air_interval).state;
+            if (incubating) fae_min = std::max(fae_min * 4.0f, 240.0f);
+            else if (pinning) fae_min = std::max(fae_min / 2.0f, 5.0f);
+
+            // Fresh-air exchange schedule
+            // uint32_t arithmetic with signed differences stays correct across the 49-day millis() wrap.
+            const uint32_t interval_ms = (uint32_t) fae_min * 60000UL;
+            const uint32_t duration_ms = (uint32_t) id(fresh_air_duration).state * 1000UL;
+            if (id(next_fresh_air) == 0) id(next_fresh_air) = now + interval_ms;
+            if ((int32_t) (now - id(next_fresh_air)) >= 0) {
+              id(fresh_air_until) = now + duration_ms;
+              id(next_fresh_air) = now + interval_ms;
+              id(last_fresh_air) = now | 1;
+              // Counted, not written to the 600-byte event log: one line an hour would push everything else out.
+              id(fresh_air_exchanges).publish_state(++id(fae_cycle));
+              ESP_LOGI("fae", "fresh-air exchange #%u", (unsigned) id(fae_cycle));
+            }
+            const bool fresh_air = (int32_t) (id(fresh_air_until) - now) > 0;
+            // Alternate ("alt-fire"): one fan per exchange, taking turns; Both: both fans together.
+            const bool alternate = std::string(id(fresh_air_mode).current_option()) == "Alternate";
+            const bool fae_fan1 = !alternate || (id(fae_cycle) % 2 == 0);
+            const bool fae_fan2 = !alternate || (id(fae_cycle) % 2 == 1);
+
+            const float hs = grow_climate::humidity_target(grow_climate::phase_from(phase.c_str()), id(humidity_setpoint).state,
+                grow_climate::pinning_rh_for(std::string(id(grow_preset).current_option()).c_str(), id(species_pinning_rh)));
+            const float ts = incubating ? id(incubation_temperature).state : id(temperature_setpoint).state;
+            // Fan speeds in stock's 0-255 duty units, converted to % for the fan entities.
+            auto pct = [](int duty) { int p = (duty * 100 + 127) / 255; return p < 1 ? 1 : p; };
+            const int X = id(idle_airflow);                 // per-species idle duty (stock: Fan1 = X, Fan2 = X+1)
+            int fan1_speed = pct(X), fan2_speed = pct(X + 1), blower_speed = 0;
+            float heat_level = 0.0f;
+            bool mist = false, want_mist = false;
+            std::string why;
+
+            if (id(hdc_heating)) {
+              state = "sensor_drying"; why = "sensor dry pulse";   // readings paused: safe idle
+              id(hum_cycle_start) = 0; id(heat_since) = 0; id(heat_full_since) = 0; id(dry_since) = 0;
+            } else if (sensor_bad) {
+              state = "sensor_error"; why = "sensor fault";
+              id(hum_cycle_start) = 0; id(heat_since) = 0; id(heat_full_since) = 0; id(dry_since) = 0;
+            } else {
+              // Over-humidity purge (stock): above 98 % stop adding moisture and vent at ~39 % until <= 89 %.
+              const bool was_purging = id(purging);
+              if (h > 98.0f) id(purging) = true; else if (h <= 89.0f) id(purging) = false;
+              if (id(purging) != was_purging) id(log_event).execute(id(purging) ? "purge start (RH > 98 %)" : "purge end");
+
+              // Soft RH ceiling (Hackshroom idea): above the ceiling for 60 s -> add no moisture until RH falls
+              // below the release level. A second layer under the purge and the hard 97 % cap.
+              const float soft_hi = id(rh_soft_ceiling).state, soft_lo = id(rh_soft_release).state;
+              if (h > soft_hi) { if (id(soft_since) == 0) id(soft_since) = now; }
+              else id(soft_since) = 0;
+              if (!id(soft_lock) && id(soft_since) != 0 && (uint32_t) (now - id(soft_since)) > 60000UL) {
+                id(soft_lock) = true; id(log_event).execute("soft RH ceiling: misting held");
+              }
+              if (id(soft_lock) && h < soft_lo) { id(soft_lock) = false; id(log_event).execute("soft RH ceiling released"); }
+
+              // Drying hysteresis (stock): start at RH >= S+2, keep going until RH <= S. Not while incubating:
+              // a colonising block doesn't care about chamber RH (only the purge above applies).
+              if (!incubating && h >= hs + 2.0f && id(dry_since) == 0) id(dry_since) = now;
+              if (id(dry_since) != 0 && (incubating || h <= hs)) id(dry_since) = 0;
+              const bool drying = id(dry_since) != 0;
+
+              // Pulsed humidify (stock): at RH <= S-5 (now S-2, below) run one 60 s cycle = 10 s atomizer, 15 s blower (atomizer
+              // off), 35 s rest. A started cycle always finishes. Never start one at >= 97 % (hard ceiling).
+              // Here the mist phase is Mist Burst seconds of atomizer time delivered as short pulses (Mist
+              // Pulse On / Off), with the blower at Mist Blower % so the fog is carried instead of falling
+              // back as drops. The cycle grows past 60 s only if the pulsed phase plus 20 s doesn't fit.
+              // Millisecond arithmetic throughout (common/mist_cycle.h), so a millis() wrap can't cut a cycle
+              // short, and the start stamp's | 1 can't make a cycle's first tick read as 49 days old.
+              const uint32_t burst_ms = (uint32_t) (id(mist_burst).state * 1000.0f);   // stock: 10 s (the "max duty" cap)
+              const uint32_t on_ms = (uint32_t) (id(mist_pulse_on).state * 1000.0f);
+              const uint32_t off_ms = (uint32_t) (id(mist_pulse_off).state * 1000.0f);
+              const mist_cycle::Timing timing = mist_cycle::timing(burst_ms, on_ms, off_ms);
+              bool cycle = id(hum_cycle_start) != 0 && mist_cycle::elapsed(now, id(hum_cycle_start)) < timing.cycle_ms;
+              // Stock starts a cycle 5 % under the target and one cycle lifts RH by only 3-5 %, so the chamber
+              // settles 2-4 % short (measured 2026-10-11: 86 % against a 90 % Pinning target, never reaching
+              // it). Pinning (since 1.2.3) and Fruiting (docs/recipe-research.md rec. 1) start at 2 % under the
+              // target instead and chain cycles until they get there; the drying hysteresis at target +2, the
+              // soft ceiling and the 97 % hard stop still bound the top. Each started cycle runs its full 60 s+,
+              // so the narrower band can't chatter the atomizer (grow_climate.h MIST_START_BELOW).
+              if (!cycle && !incubating && !id(purging) && !id(soft_lock) && !fresh_air && grow_climate::mist_may_start(h, hs)) {
+                id(hum_cycle_start) = mist_cycle::stamp(now); cycle = true;
+              }
+              if (!cycle) id(hum_cycle_start) = 0;
+
+              if (id(purging)) {
+                fan1_speed = fan2_speed = pct(100);
+                state = "purging"; why = "over-humidity purge (>98 %)";
+              } else if (cycle) {
+                const mist_cycle::Phase ph = mist_cycle::phase(mist_cycle::elapsed(now, id(hum_cycle_start)), timing);
+                want_mist = true;
+                if (ph == mist_cycle::Phase::MIST) { mist = true; blower_speed = (int) id(mist_blower).state; why = "misting"; }
+                else if (ph == mist_cycle::Phase::BLOWER) { blower_speed = 100; why = "cycle: blower phase"; }
+                else why = "cycle: resting";
+                state = "humidifying";
+              } else if (incubating) {
+                state = "incubating"; why = "incubation: no misting";
+              } else if (id(soft_lock)) {
+                state = "idle"; why = "soft RH ceiling";
+              } else if (!drying && grow_climate::in_top_up_band(h, hs)) {
+                blower_speed = 100;                         // stock: near the target, circulate only
+                state = "topping_up"; why = "near target: blower only";
+              } else if (drying) {
+                const bool late = (uint32_t) (now - id(dry_since)) > 180000UL;   // stock: step up after 180 s
+                fan1_speed = pct(late ? 32 : 20); fan2_speed = pct(late ? 35 : 22);
+                state = "drying"; why = "above target";
+              } else {
+                state = "idle"; why = h >= 97.0f ? "RH ceiling (97 %)" : "at target";
+              }
+
+              // Heater (stock): start at T <= S-2 °F at 22 % for 60 s, then 100 %, stop at T >= S.
+              if (id(heat_since) == 0 && t <= ts - 2.0f && t < ${max_safe_temp_f}) id(heat_since) = now;
+              if (id(heat_since) != 0 && (t >= ts || t >= ${max_safe_temp_f})) id(heat_since) = 0;
+              if (id(heat_since) != 0) {
+                const uint32_t heat_ms = now - id(heat_since);
+                heat_level = heat_ms < 60000UL ? 0.22f : 1.0f;
+                // Stock spreads heat with the fans: 20/25, then 30/40 after 300 s (out of 255).
+                const bool late = heat_ms > 300000UL;
+                fan1_speed = std::max(fan1_speed, pct(late ? 30 : 20));
+                fan2_speed = std::max(fan2_speed, pct(late ? 40 : 25));
+                if (state == "idle" || state == "incubating") state = "heating";
+              }
+              // Never heat still air, part two: with the blower reported missing there's nothing to spread
+              // 100 % heat, so the heater stays at its 22 % stage. Logged once per fault.
+              static bool blower_cap_logged = false;
+              if (id(blower_missing).state) {
+                if (heat_level > 0.22f) heat_level = 0.22f;
+                if (heat_level > 0 && !blower_cap_logged) { blower_cap_logged = true; id(log_event).execute("heater held at 22 %: blower not detected"); }
+              } else {
+                blower_cap_logged = false;
+              }
+              // Can't-keep-up / runaway check: 45 min at 100 % without the temperature rising 0.9 °F (0.5 °C)
+              // means a stuck, unplugged or undersized heater, an open door or a very cold room. Cut it and
+              // latch Heater Stalled until the setpoint changes or Climate Control is toggled.
+              if (heat_level >= 1.0f && !id(heater_stalled).state) {
+                if (id(heat_full_since) == 0) { id(heat_full_since) = now | 1; id(heat_full_temp) = t; }
+                else if ((uint32_t) (now - id(heat_full_since)) > 45UL * 60000UL && t - id(heat_full_temp) < 0.9f) {
+                  id(heater_stalled).publish_state(true);
+                  char msg[72];
+                  snprintf(msg, sizeof(msg), "heater stalled: 45 min at 100 %% raised %.1f °F; heater off", t - id(heat_full_temp));
+                  id(log_event).execute(msg);
+                }
+              } else if (heat_level < 1.0f) {
+                id(heat_full_since) = 0;
+              }
+              if (id(heater_stalled).state) { heat_level = 0; id(heat_since) = 0; id(heat_full_since) = 0; }
+
+              // Scheduled fresh-air exchange (addition over stock). Misting pauses; a started cycle's mist is cut.
+              if (fresh_air) {
+                mist = false; blower_speed = 0;
+                if (std::string(id(fresh_air_mode).current_option()) == "Two-phase") {
+                  // Hackshroom-style real exchange: first half intake fan + blower, second half exhaust only.
+                  const bool intake_is_1 = std::string(id(intake_fan).current_option()) == "Fan 1";
+                  const uint32_t dur = (uint32_t) id(fresh_air_duration).state * 1000UL;
+                  const bool first_half = (int32_t) (id(fresh_air_until) - now) > (int32_t) (dur / 2);
+                  const int in_s = first_half ? 100 : pct(X), ex_s = first_half ? pct(X) : 100;
+                  fan1_speed = intake_is_1 ? in_s : ex_s;
+                  fan2_speed = intake_is_1 ? ex_s : in_s;
+                  if (first_half) blower_speed = 100;
+                  why = first_half ? "fresh air: intake phase" : "fresh air: exhaust phase";
+                } else {
+                  fan1_speed = fae_fan1 ? 80 : fan1_speed;
+                  fan2_speed = fae_fan2 ? 80 : fan2_speed;
+                  why = "fresh-air exchange";
+                }
+                state = "fresh_air";
+              }
+            }
+            id(mist_demand) = want_mist && !fresh_air;
+            if (water_lockout) {
+              // Stock cut only the atomizer and UV on low water; also stop the humidify blower.
+              if (want_mist || state == "topping_up" || state == "idle" || id(tank_empty_alert).state) state = "low_water";
+              mist = false;
+              if (want_mist || state == "low_water") blower_speed = 0;
+              why = id(atomizer_hard_stop).state ? (id(tank_empty_alert).state ? "tank empty? (hard stop)" : "hard stop") : "low water";
+            }
+            // Hackshroom: never heat still air. Applied last so a fresh-air exchange or the low-water stop
+            // can't set the blower below the interlock's 30 % (they would fight it every second).
+            if (heat_level > 0) blower_speed = std::max(blower_speed, 30);
+            if (id(mist_status).state != why) id(mist_status).publish_state(why);
+
+            // In the mist phase the 250 ms pulser below switches the atomizer on and off; outside it the
+            // controller makes sure it's off.
+            id(mist_phase) = mist;
+            if (!mist) set_switch(id(atomizer), false);
+            if (heat_level > 0 && heat_level != id(heater_level)) {
+              id(heater_level) = heat_level;
+              if (id(heater).state) id(heater_pwm).set_level(heat_level);
+            }
+            set_switch(id(heater), heat_level > 0);
+            // A refused start (no trustworthy reading yet) must not keep the 22 % clock running, or the
+            // heater would come on straight at 100 % once the reading is back.
+            if (heat_level > 0 && !id(heater).state) id(heat_since) = 0;
+            set_fan(id(fan_1), fan1_speed);
+            set_fan(id(fan_2), fan2_speed);
+            set_fan(id(blower), blower_speed);
+          }
+          if (!id(climate_control).state || self_testing) {
+            // Automation off: forget every run so a restart begins gently (22 % heater stage, fresh cycles).
+            id(hum_cycle_start) = 0; id(heat_since) = 0; id(dry_since) = 0; id(purging) = false;
+            id(mist_phase) = false; id(heat_full_since) = 0;
+            const char *why = id(atomizer_hard_stop).state ? "hard stop"
+                            : self_testing ? "self-test" : "climate control off";
+            if (id(mist_status).state != why) id(mist_status).publish_state(why);
+          }
+          if (id(grow_state).state != state) id(grow_state).publish_state(state);
+
+  # Mist pulser: during a cycle's mist phase the atomizer runs Mist Pulse On seconds, rests Mist Pulse Off
+  # seconds, and so on (Mist Pulse Off 0 = continuous, the old behaviour). Short pulses let each puff of fog
+  # get carried off by the blower instead of pooling and splashing. The controller sets mist_phase and
+  # the phase start (hum_cycle_start); the water lockout and the interlocks clear mist_phase through it.
+  - interval: 250ms
+    then:
+      - lambda: |-
+          if (!id(mist_phase) || !id(climate_control).state) return;
+          // The controller clears mist_phase within a second of a lockout; until then don't keep knocking on
+          // a switch that would refuse (and log) every pulse.
+          if ((id(low_water).state && !id(water_lockout_override).state) || id(atomizer_hard_stop).state) return;
+          const uint32_t e = mist_cycle::elapsed(millis(), id(hum_cycle_start));
+          const uint32_t on_ms = (uint32_t) (id(mist_pulse_on).state * 1000.0f);
+          const uint32_t off_ms = (uint32_t) (id(mist_pulse_off).state * 1000.0f);
+          const bool on = mist_cycle::pulse_on(e, on_ms, off_ms);
+          if (id(atomizer).state == on) return;
+          id(auto_writing) = true;
+          on ? id(atomizer).turn_on() : id(atomizer).turn_off();
+          id(auto_writing) = false;
+
+  # Passive load check (common/load_check.h): watches for ONE load switching on with nothing else on the
+  # rail changing, then compares Load Current before and after. It never switches anything itself.
+  - interval: 200ms
+    then:
+      - lambda: |-
+          using namespace load_check;
+          if (id(self_test).is_running()) { watcher().reset(); return; }   // it measures for itself
+          Snapshot s;
+          fan::Fan *fans[3] = {id(fan_1), id(fan_2), id(blower)};
+          for (int i = 0; i < 3; i++) { s.on[i] = fans[i]->state; s.level[i] = fans[i]->state ? fans[i]->speed / 100.0f : 0; }
+          s.on[ATOMIZER] = id(atomizer).state; s.level[ATOMIZER] = id(atomizer).state ? 1.0f : 0;
+          s.on[HEATER] = id(heater).state; s.level[HEATER] = id(heater).state ? id(heater_level) : 0;
+          // Everything else that draws from the 24 V rail. The top light alone moves it ~46 mA at full white.
+          uint32_t h = mix(mix(MIX_SEED, id(uv_lamp).state), id(camera_power).state);
+          for (auto *l : {id(top_light), id(bottom_light)}) {
+            const auto &v = l->remote_values;
+            h = mix(h, v.is_on());
+            for (float f : {v.get_brightness(), v.get_red(), v.get_green(), v.get_blue()}) h = mix(h, (uint32_t) (f * 1000));
+            if (l->get_current_effect_index() != 0 || l->is_transformer_active()) s.quiet = false;
+          }
+          s.others = h;
+          bool want_read = false;
+          const Verdict v = watcher().poll(s, millis(), &want_read);
+          if (want_read) id(ina).update();   // one-shot reading; comes back through Load Current's on_value
+          if (v.result == Verdict::NONE) return;
+          const int ma = (int) lroundf(v.delta_a * 1000.0f);
+          if (v.result == Verdict::UNSURE) {
+            ESP_LOGD("loadcheck", "%s: +%d mA, inconclusive", SPECS[v.load].label, ma);
+            return;
+          }
+          id(load_verdict).execute((int) v.load, v.result == Verdict::DETECTED, ma, true);
+
+  # Daily grow-light schedule: Top Light on from Light Start Hour (default 08:00) for Light Hours (only
+  # in Climate Control mode). Improvement over stock, which only switched the light manually from the app.
+  # It acts only when the scheduled state changes (lights-on, lights-out, a Light Hours or Light Start
+  # Hour change, or Climate Control turning on), so a manual on/off or colour change sticks until the next
+  # change. Turning on keeps the light's last colour, brightness and effect.
+  # It sits out the self-test (a light switching mid-measurement spoils the current reading) and
+  # catches up on the next minute: light_sched_on still holds the state it last applied.
+  - interval: 60s
+    then:
+      - lambda: |-
+          if (id(self_test).is_running()) return;
+          if (!id(climate_control).state) { id(light_sched_on) = -1; return; }
+          auto now = id(sntp_time).now();
+          if (!now.is_valid()) return;
+          const float h = now.hour + now.minute / 60.0f;
+          float since_start = h - id(light_start_hour).state;   // hours into the light day, wrapping past midnight
+          if (since_start < 0) since_start += 24.0f;
+          // Incubation runs dark: light is a fruiting trigger.
+          const bool on = std::string(id(grow_phase).current_option()) != "Incubation"
+                          && since_start < id(light_hours).state;
+          if (id(light_sched_on) == (on ? 1 : 0)) return;
+          id(light_sched_on) = on ? 1 : 0;
+          auto *l = id(top_light);
+          if (l->current_values.is_on() == on) return;
+          id(auto_writing) = true;
+          (on ? l->turn_on() : l->turn_off()).perform();
+          id(auto_writing) = false;
+
+  # Grow-phase check (docs/grow-phases.md). Once a phase has run its days, or a fresh Camera Stage
+  # observation says the block is ahead of its phase, the chamber either asks the owner (Phase Check +
+  # Phase Question, answered with Advance Phase / Not Yet), switches by itself (Automatic) or only
+  # counts days (Manual). It runs whether or not Climate Control is on: asking is harmless.
+  - interval: 60s
+    then:
+      - lambda: |-
+          auto clear = [&]() {
+            id(phase_next) = "";
+            if (!id(phase_check).has_state() || id(phase_check).state) id(phase_check).publish_state(false);
+            if (!id(phase_question).has_state() || id(phase_question).state != "") id(phase_question).publish_state("");
+          };
+          auto now = id(sntp_time).now();
+          const std::string phase = id(grow_phase).current_option();
+          if (id(grow_start) == 0 || !now.is_valid() || phase == "Fruiting") { clear(); return; }
+          if (id(phase_start) == 0) id(phase_start) = now.timestamp;   // phase changed before time sync
+          const bool incubating = phase == "Incubation";
+          const int day = (int) ((now.timestamp - id(phase_start)) / 86400) + 1;
+          const float due_days = incubating ? id(incubation_days).state : id(pinning_days).state;
+
+          // Camera evidence counts only while fresh (36 h), so a stale "Pinning" can't trigger forever.
+          const std::string cam = id(camera_stage).current_option();
+          const bool cam_fresh = id(camera_stage_at) != 0 && now.timestamp - id(camera_stage_at) < 36UL * 3600UL;
+          const int rank = cam == "Colonizing" ? 1 : cam == "Colonized" ? 2 : cam == "Pinning" ? 3 : cam == "Fruiting" ? 4 : 0;
+          const bool cam_ahead = cam_fresh && rank >= (incubating ? 2 : 3);
+          // Pins already showing during incubation: skip Pinning.
+          const std::string next = incubating && cam_fresh && rank >= 3 ? "Fruiting" : incubating ? "Pinning" : "Fruiting";
+
+          const bool due = day > (int) due_days || cam_ahead;
+          const bool snoozed = id(phase_snooze_until) > now.timestamp;
+          const std::string mode = id(phase_advance).current_option();
+          if (!due || snoozed || mode == "Manual") { clear(); return; }
+
+          if (mode == "Automatic") {
+            id(log_event).execute("phase auto-advance: " + phase + " -> " + next + (cam_ahead ? " (camera: " + cam + ")" : ""));
+            id(grow_phase).make_call().set_option(next).perform();
+            return;
+          }
+
+          // Ask me
+          std::string q;
+          if (cam_ahead) q = "Camera: the block looks " + str_lower_case(cam) + ". ";
+          if (incubating && next == "Fruiting") q += "Pins already? Skip pinning and start fruiting?";
+          else if (incubating) q += "Incubation day " + to_string(day) + ": is the block fully colonized (solid white)? Start pinning?";
+          else q += "Pinning day " + to_string(day) + ": do you see pins (tiny mushroom bumps)? Start fruiting?";
+          const bool fresh_question = !id(phase_check).state;
+          id(phase_next) = next;
+          if (id(phase_question).state != q) id(phase_question).publish_state(q);
+          if (fresh_question) {
+            id(phase_check).publish_state(true);
+            id(log_event).execute("asked: " + phase + " -> " + next + "?");
+          }
+
+# UV-free port of the stock self-test (0x400d6d7c), which ran every load and judged it by INA219 current.
+# Stock also switched UV-C on; this one never turns it on (it switches it off before measuring).
+script:
+  # Camera power on, never sooner than 10 s after it went off (boot counts as off).
+  - id: camera_power_on
+    mode: single
+    then:
+      - wait_until:
+          condition:
+            lambda: return millis() - id(camera_off_at) >= 10000;
+      - switch.turn_on: camera_power_pin
+
+  # Ends a bench probe test: 5 min after the last change, drive and pull go back to stock.
+  - id: water_probe_test_timeout
+    mode: restart
+    then:
+      - delay: 5min
+      - select.set: { id: water_probe_drive_mode, option: "Pulse (stock)" }
+      - select.set: { id: water_probe_pull, option: "Pull-down (stock)" }
+
+  # Manual atomizer cap: an atomizer a person switched on (the app, the web UI, a bench) goes off by itself
+  # after Manual Mist Limit seconds, so a forgotten switch can't run the disc dry or flood the chamber.
+  # The controller's own mist pulses never start this.
+  - id: manual_mist_timeout
+    mode: restart
+    then:
+      - delay: !lambda return (uint32_t) id(manual_mist_limit).state * 1000UL;
+      - if:
+          condition:
+            switch.is_on: atomizer
+          then:
+            - lambda: |-
+                id(auto_writing) = true; id(atomizer).turn_off(); id(auto_writing) = false;
+                id(log_event).execute("Atomizer auto-off: Manual Mist Limit " + to_string((int) id(manual_mist_limit).state) + " s");
+
+  # Writes saved state to flash now instead of at the next 60 s flush, so a power cut straight after
+  # Start Grow, End Grow or a Climate Control change doesn't lose it. Saved globals only reach the flash
+  # queue on their next 1 s poll, hence the short wait before the sync.
+  - id: save_now
+    mode: restart
+    then:
+      - delay: 1500ms
+      - lambda: global_preferences->sync();
+
+  # Event log (Hackshroom idea): newest-first list of "MM-DD HH:MM text" lines, saved to flash.
+  - id: log_event
+    parameters:
+      msg: std::string
+    mode: queued
+    then:
+      - lambda: |-
+          auto now = id(sntp_time).now();
+          char stamp[16];
+          if (now.is_valid()) snprintf(stamp, sizeof(stamp), "%02d-%02d %02d:%02d ", now.month, now.day_of_month, now.hour, now.minute);
+          else snprintf(stamp, sizeof(stamp), "+%lus ", (unsigned long) (millis() / 1000));
+          std::string line = std::string(stamp) + msg + "\n";
+          std::string old(id(evlog).data(), strnlen(id(evlog).data(), id(evlog).size()));
+          std::string all = line + old;
+          if (all.size() > id(evlog).size() - 1) {
+            all.resize(id(evlog).size() - 1);
+            auto cut = all.rfind('\n');
+            if (cut != std::string::npos) all.resize(cut + 1);
+          }
+          id(evlog).fill(0);
+          memcpy(id(evlog).data(), all.data(), all.size());
+          id(event_log).publish_state(all);
+          ESP_LOGI("event", "%s", msg.c_str());
+
+  # HDC1080 dry pulse (Hackshroom idea, own implementation): at 90 %+ RH the sensor saturates and reads
+  # high. Its built-in heater (config reg 0x02 bit 13) heats during conversions, so: heater bit on, convert
+  # continuously for 30 s, heater off, then 3 min cool-down. Readings are discarded throughout and the
+  # controller holds a safe idle ("sensor_drying").
+  - id: hdc_dry_pulse
+    mode: single
+    then:
+      - script.execute: { id: log_event, msg: "sensor dry pulse" }
+      - lambda: |-
+          id(hdc_heating) = true;
+          id(last_dry_pulse) = millis() | 1;   // never 0, which means "never pulsed"
+          id(rh_high_since) = 0;
+          const uint8_t heat_on[3] = {0x02, 0x20, 0x00};
+          id(i2c_bus)->write(0x40, heat_on, 3);
+          ESP_LOGI("hdc", "dry pulse: heater on");
+      - repeat:
+          count: 300
+          then:
+            - lambda: |-
+                const uint8_t trig = 0x00;   // start a temperature+humidity conversion (heater active)
+                id(i2c_bus)->write(0x40, &trig, 1);
+            - delay: 100ms
+      - lambda: |-
+          const uint8_t heat_off[3] = {0x02, 0x00, 0x00};
+          id(i2c_bus)->write(0x40, heat_off, 3);
+          ESP_LOGI("hdc", "dry pulse: heater off, cooling 3 min");
+      - delay: 3min
+      - lambda: |-
+          id(hdc_heating) = false;
+          id(last_climate_update) = millis();   // fresh window for the stale check
+          ESP_LOGI("hdc", "dry pulse done");
+
+  # One load-check verdict -> its "Not Detected" sensor. The passive watcher needs two misses in a row
+  # (one detection clears it); a self-test result counts at once. Only passive changes are logged here:
+  # the self-test logs one summary line, to spare the 600-byte event log.
+  - id: load_verdict
+    parameters:
+      load: int
+      found: bool
+      delta_ma: int
+      passive: bool
+    mode: queued
+    then:
+      - lambda: |-
+          static int misses[load_check::COUNT] = {};
+          if (load < 0 || load >= load_check::COUNT) return;
+          binary_sensor::BinarySensor *flags[load_check::COUNT] = {
+              id(fan_1_missing), id(fan_2_missing), id(blower_missing), id(atomizer_missing), id(heater_missing)};
+          auto *flag = flags[load];
+          const std::string label = load_check::SPECS[load].label;
+          char ma[16];
+          snprintf(ma, sizeof(ma), "%+d mA", delta_ma);
+          if (found) {
+            misses[load] = 0;
+            if (flag->state && passive) id(log_event).execute(label + " detected again (" + ma + ")");
+            if (flag->state || !flag->has_state()) flag->publish_state(false);
+            return;
+          }
+          if (passive && ++misses[load] < 2) {
+            ESP_LOGW("loadcheck", "%s switched on but the current only moved %s (1st miss)", label.c_str(), ma);
+            return;
+          }
+          misses[load] = 2;
+          if (!flag->state) {
+            if (passive) id(log_event).execute(label + " not detected (" + ma + ")");
+            flag->publish_state(true);
+          }
+
+  # Self-test helper: one measurement into self_test_math::session().cur. It notes the rail fingerprint
+  # (UV-C, camera power, both lights: what the passive watcher calls "others"), then takes SAMPLES (8)
+  # one-shot INA219 readings 300 ms apart, flagging any light effect or transition that runs meanwhile.
+  - id: st_measure
+    mode: single
+    then:
+      - lambda: |-
+          using namespace load_check;
+          auto &m = self_test_math::session().cur;
+          m.clear();
+          uint32_t h = mix(mix(MIX_SEED, id(uv_lamp).state), id(camera_power).state);
+          for (auto *l : {id(top_light), id(bottom_light)}) {
+            const auto &v = l->remote_values;
+            h = mix(h, v.is_on());
+            for (float f : {v.get_brightness(), v.get_red(), v.get_green(), v.get_blue()}) h = mix(h, (uint32_t) (f * 1000));
+          }
+          m.others = h;
+      - repeat:
+          count: 8   # self_test_math::SAMPLES
+          then:
+            - lambda: |-
+                auto &m = self_test_math::session().cur;
+                id(ina).update();
+                m.add(id(load_current).state);   // a NAN reading is left out
+                for (auto *l : {id(top_light), id(bottom_light)})
+                  if (l->get_current_effect_index() != 0 || l->is_transformer_active()) m.quiet = false;
+            - delay: 300ms
+
+  # Each load alone for 5 s, judged by its current jump against load_check::SPECS[].ok_a, in stock's
+  # order: Fan1, Fan2, Blower, Atomizer, Heater. Every load is bracketed (self_test_math.h): a baseline
+  # just before it switches on, the reading after 5 s, and a baseline again 2 s after it is off; the
+  # delta is on - mean(before, after). Readings that spread too wide, baselines that disagree, or
+  # anything else on the rail changing between the baselines make the verdict UNSURE, never FAIL.
+  # The rail is kept quiet meanwhile: light effects pause, the light schedule and the auto dry pulse sit
+  # out, and camera power cycles are deferred. The atomizer only runs with water (or the bench override)
+  # and no hard stop; the heater only at its gentle 22 % stage, and its own turn_on_action refuses without
+  # a trustworthy temperature. Climate Control keeps its setting: the controller sits out while this runs.
+  # About 80 s in all.
+  - id: self_test
+    mode: single
+    then:
+      - text_sensor.template.publish:
+          id: self_test_result
+          state: "running"
+      - lambda: |-
+          // With Climate Control off these are a person's settings: remember them and put them back after
+          // the test (with it on, the controller re-drives everything itself).
+          id(st_restore) = !id(climate_control).state;
+          fan::Fan *st_fans[3] = {id(fan_1), id(fan_2), id(blower)};
+          for (int i = 0; i < 3; i++) id(st_fan_speeds)[i] = st_fans[i]->state ? st_fans[i]->speed : 0;
+          id(st_atomizer_was_on) = id(atomizer).state;
+          id(st_heater_was_on) = id(heater).state;
+          auto &s = self_test_math::session();
+          id(auto_writing) = true;
+          id(fan_1).turn_off().perform(); id(fan_2).turn_off().perform(); id(blower).turn_off().perform();
+          id(atomizer).turn_off(); id(heater).turn_off();
+          id(uv_lamp).turn_off();   // never tested, and a lit lamp would skew every reading
+          // Pause light effects: the bottom light's Status effect pulses its brightness +/-45 %, which moves
+          // the rail by more than the blower's whole +6 mA. Restored at the end.
+          light::LightState *lights[2] = {id(top_light), id(bottom_light)};
+          for (int i = 0; i < 2; i++) {
+            s.light_effect[i] = lights[i]->get_current_effect_index();
+            if (s.light_effect[i] != 0) {
+              auto call = lights[i]->make_call();
+              call.set_effect((uint32_t) 0);
+              call.set_transition_length(0);
+              call.perform();
+            }
+          }
+          id(cam_link)->set_defer_power_cycles(true);   // a camera switching off or booting moves the rail
+          id(auto_writing) = false;
+          id(st_report) = "";
+          id(st_missing) = "";
+      - delay: 6s
+      - repeat:
+          count: 5   # iteration = load_check::Load
+          then:
+            # Baseline, right before the load switches on.
+            - script.execute: st_measure
+            - script.wait: st_measure
+            - lambda: |-
+                using namespace load_check;
+                auto &s = self_test_math::session();
+                s.bracket.clear();
+                s.bracket.before = s.cur;
+                id(st_skip) = "";
+                if (s.cur.empty()) { id(st_skip) = "no current reading"; return; }
+                id(auto_writing) = true;
+                switch ((Load) iteration) {
+                  case FAN1: id(fan_1).turn_on().set_speed(100).perform(); break;
+                  case FAN2: id(fan_2).turn_on().set_speed(100).perform(); break;
+                  case BLOWER: id(blower).turn_on().set_speed(100).perform(); break;
+                  case ATOMIZER:
+                    if ((id(low_water).state && !id(water_lockout_override).state) || id(atomizer_hard_stop).state)
+                      id(st_skip) = "low water or hard stop";
+                    else
+                      id(atomizer).turn_on();
+                    break;
+                  case HEATER:
+                    id(heater_level) = 0.22f;
+                    id(heater).turn_on();
+                    if (!id(heater).state) id(st_skip) = "no temperature reading";
+                    break;
+                  default: break;
+                }
+                id(auto_writing) = false;
+            - if:
+                condition:
+                  lambda: return id(st_skip).empty();
+                then:
+                  # The load has run 5 s: measure it, switch everything off, settle, baseline again.
+                  - delay: 5s
+                  - script.execute: st_measure
+                  - script.wait: st_measure
+                  - lambda: |-
+                      auto &s = self_test_math::session();
+                      s.bracket.on = s.cur;
+                      id(auto_writing) = true;
+                      // Everything off, including the blower the heater interlock may have started.
+                      id(fan_1).turn_off().perform(); id(fan_2).turn_off().perform(); id(blower).turn_off().perform();
+                      id(atomizer).turn_off(); id(heater).turn_off();
+                      id(auto_writing) = false;
+                  - delay: 2s
+                  - script.execute: st_measure
+                  - script.wait: st_measure
+                  - lambda: |-
+                      using namespace load_check;
+                      using self_test_math::Result;
+                      auto &s = self_test_math::session();
+                      s.bracket.after = s.cur;
+                      const Spec &spec = SPECS[iteration];
+                      const auto v = self_test_math::judge(spec, s.bracket);
+                      const std::string item = self_test_math::report(spec, v);
+                      id(st_report) += item;
+                      ESP_LOGI("selftest", "%s(before %.1f, on %.1f, after %.1f mA)", item.c_str(),
+                               s.bracket.before.mean() * 1000.0f, s.bracket.on.mean() * 1000.0f, s.bracket.after.mean() * 1000.0f);
+                      if (v.result == Result::FAIL)
+                        id(st_missing) += (id(st_missing).empty() ? "" : ", ") + std::string(spec.label);
+                      // Only OK and FAIL reach the "Not Detected" sensor. UNSURE (noisy or changed rail, or a
+                      // load too quiet to tell from noise) and SKIPPED never set or clear it.
+                      if (v.result == Result::OK || v.result == Result::FAIL)
+                        id(load_verdict).execute((int) iteration, v.result == Result::OK, (int) lroundf(v.delta_a * 1000.0f), false);
+                else:
+                  - lambda: |-
+                      id(auto_writing) = true;
+                      id(heater).turn_off();   // a refused start reports off already; this is belt and braces
+                      id(auto_writing) = false;
+                      id(st_report) += std::string(load_check::SPECS[iteration].name) + " SKIPPED (" + id(st_skip) + "); ";
+      - lambda: |-
+          // The rail is free again: effects back on the lights that still show, camera cycles allowed.
+          auto &s = self_test_math::session();
+          light::LightState *lights[2] = {id(top_light), id(bottom_light)};
+          id(auto_writing) = true;
+          for (int i = 0; i < 2; i++) {
+            if (s.light_effect[i] != 0 && lights[i]->remote_values.is_on()) {
+              auto call = lights[i]->make_call();
+              call.set_effect(s.light_effect[i]);
+              call.perform();
+            }
+            s.light_effect[i] = 0;
+          }
+          id(cam_link)->set_defer_power_cycles(false);
+          id(auto_writing) = false;
+          id(self_test_result).publish_state(id(st_report));
+          std::string msg = id(st_boot) ? "boot self-test: " : "self-test: ";
+          msg += id(st_missing).empty() ? "all tested loads found" : id(st_missing) + " not detected";
+          id(log_event).execute(msg);
+          id(st_boot) = false;
+          // Put a person's manual settings back (Climate Control was off, so nothing logs as a "manual
+          // change"). The atomizer goes through its own lockout and Manual Mist Limit, the heater through
+          // its interlocks, as if the person had switched them on again.
+          if (id(st_restore) && !id(climate_control).state) {
+            fan::Fan *st_fans[3] = {id(fan_1), id(fan_2), id(blower)};
+            for (int i = 0; i < 3; i++) {
+              if (id(st_fan_speeds)[i] > 0) st_fans[i]->turn_on().set_speed(id(st_fan_speeds)[i]).perform();
+            }
+            if (id(st_atomizer_was_on)) id(atomizer).turn_on();
+            if (id(st_heater_was_on)) id(heater).turn_on();
+          }
+          id(st_restore) = false;
+
+# ---------------------------------------------------------------- user controls
+switch:
+  - platform: template
+    id: climate_control
+    name: Climate Control
+    web_server:
+      sorting_group_id: grp_grow
+      sorting_weight: 2
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF   # first boot does nothing until the owner turns automation on
+    on_turn_on:
+      - lambda: |-   # toggling clears the latch
+          if (id(heater_stalled).state) id(heater_stalled).publish_state(false);
+          id(grow_paused) = false;   // turning it on is how a paused grow resumes
+      - script.execute: { id: log_event, msg: "climate control on" }
+      - script.execute: save_now
+    on_turn_off:
+      - lambda: |-
+          if (id(heater_stalled).state) id(heater_stalled).publish_state(false);
+      - script.execute: { id: log_event, msg: "climate control off" }
+      - script.execute: save_now
+
+  # Run the self-test once after every boot (about 80 s, starting 90-180 s after power-up once the rail is
+  # quiet: each load alone for 5 s, heater at 22 %, atomizer only with water and no hard stop, UV-C never).
+  # Off = only the passive check and the button.
+  - platform: template
+    id: boot_self_test
+    name: Boot Self-Test
+    icon: mdi:clipboard-check-outline
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    entity_category: config
+    web_server:
+      sorting_group_id: grp_health
+      sorting_weight: 9
+
+  # Atomizer hard stop (Hackshroom idea): blocks the atomizer completely (auto, manual, self-test, override)
+  # and is saved to flash, so it survives reboots. For cleaning or when the tank is out.
+  - platform: template
+    id: atomizer_hard_stop
+    name: Atomizer Hard Stop
+    web_server:
+      sorting_group_id: grp_water
+      sorting_weight: 5
+    icon: mdi:water-off
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    on_turn_on:
+      - switch.turn_off: atomizer
+    on_turn_off:
+      - lambda: id(tank_empty) = false;   # refilled: clearing the hard stop clears the alert (and its saved copy)
+      - binary_sensor.template.publish:
+          id: tank_empty_alert
+          state: OFF
+
+  # Bench-only: lets the atomizer run while the water probe misreads. Never restored, auto-off after 10 min.
+  - platform: template
+    id: water_lockout_override
+    name: Water Lockout Override
+    web_server:
+      sorting_group_id: grp_maint
+      sorting_weight: 1
+    icon: mdi:water-alert
+    entity_category: config
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    on_turn_on:
+      - logger.log:
+          level: WARN
+          format: "Water lockout override ON (auto-off in 10 min). Make sure the tank has water."
+      - delay: 10min
+      - switch.turn_off: water_lockout_override
+
+  # UV-C sterilising lamp (GPIO18). EYE AND SKIN HAZARD, and it kills fungi: the chamber must be closed,
+  # empty of cultures, and nobody should look into it while this is on. Stock had a plain app switch
+  # (V18 handler 0x400d7820: digitalWrite(18, v == 1) while the unit is powered on), cut on low water and
+  # power-off. This is that switch plus a hard auto-off. The web API has no login, so these safeguards are
+  # what protect it: never on at boot (ALWAYS_OFF), never turned on by the controller or the self-test,
+  # refused and cut while Low Water is on (which folds in Water Sensing and Tank Empty Alert), a hard
+  # auto-off after "UV-C Auto-Off" minutes (60 max) that pressing UV-C Lamp again never extends, and a
+  # budget of 60 lit minutes in any 24 hours that survives reboots (common/uvc_budget.h). The public build
+  # also asks who's asking (common/owner_gate.h): the paired app's signed key (web_guard), or the rear-button
+  # Pair window on a chamber no phone has paired with yet. The 1 s and 2 s intervals above enforce the cut-offs,
+  # and both wrappers' `ota: on_begin` turn it off because they can't run during an upload. This template
+  # wraps the internal GPIO, so a refused turn-on never energises the pin. With the opt-in lid reed package
+  # (common/lid-interlock.yaml) it is also refused while the lid isn't proven shut, and cut when it opens.
+  - platform: template
+    id: uv_lamp
+    name: UV-C Lamp
+    web_server:
+      sorting_group_id: grp_uvc
+      sorting_weight: 1
+    icon: mdi:lightbulb-fluorescent-tube-outline
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    on_turn_on:
+      - lambda: |-
+          // uv_lid_ok: always true here; the opt-in lid reed package (common/lid-interlock.yaml) holds it false
+          // whenever the lid isn't proven shut, and cuts a lit lamp itself.
+          // Already lit: another "on" changes nothing. The deadline set at turn-on stands, so pressing again
+          // can't stretch a run past UV-C Auto-Off.
+          if (id(uv_off_at) != 0 && id(uv_c).state) return;
+          const char *why = nullptr;
+          uint32_t run_s = 0;
+          if (id(low_water).state) why = "UV-C blocked: reservoir low/empty";
+          else if (!id(uv_lid_ok)) why = "UV-C blocked: lid open";
+          else if (!owner_gate::paired_or_present()) why = "UV-C blocked: hold the rear button 2-4 s first (no paired phone)";
+          else if ((run_s = uvc_budget::run_seconds(uvc_budget::g_store.ledger, (uint32_t) id(uv_minutes).state * 60)) == 0)
+            why = "UV-C blocked: 60 min in 24 h used";
+          if (why != nullptr) {
+            id(uv_c).turn_off();
+            id(uv_off_at) = 0;
+            id(uv_lamp).publish_state(false);   // refuse: reflect that the lamp stayed off
+            id(log_event).execute(why);
+            return;
+          }
+          id(uv_off_at) = (millis() + run_s * 1000UL) | 1;   // | 1: never 0, which the 1 s interval reads as "lamp off"
+          id(uv_c).turn_on();
+          id(uvc_remaining).publish_state(run_s);
+          id(log_event).execute("UV-C on, auto-off in " + to_string((run_s + 59) / 60) + " min");
+    on_turn_off:
+      - lambda: |-
+          id(uv_c).turn_off();
+          const bool was_on = id(uv_off_at) != 0;
+          id(uv_off_at) = 0;
+          id(uvc_remaining).publish_state(0);
+          if (was_on) id(log_event).execute("UV-C off");
+
+  - platform: output
+    id: atomizer
+    name: Atomizer
+    web_server:
+      sorting_group_id: grp_water
+      sorting_weight: 4
+    output: atomizer_pwm
+    restore_mode: ALWAYS_OFF
+    on_turn_on:
+      - lambda: |-
+          // Lockout first: with low water (and no bench override) or the Hard Stop the output goes straight
+          // back off, whoever asked, and automation is left as it was.
+          if ((id(low_water).state && !id(water_lockout_override).state) || id(atomizer_hard_stop).state) {
+            id(atomizer).turn_off();
+            id(log_event).execute(id(atomizer_hard_stop).state ? "Atomizer blocked: hard stop" : "Atomizer blocked: low water");
+            return;
+          }
+          // Boot-time restores and the controller's own writes don't count as a person's change.
+          if (id(auto_writing) || !id(booted)) return;
+          // A person switched it on: it goes off again after Manual Mist Limit, and automation pauses so
+          // it doesn't fight them.
+          id(manual_mist_timeout).execute();
+          if (!id(climate_control).state) return;
+          id(log_event).execute("manual Atomizer change: automation paused");
+          id(climate_control).turn_off();
+    on_turn_off:
+      - lambda: |-
+          id(atomizer_off_at) = millis();
+          id(manual_mist_timeout).stop();
+
+  - platform: template
+    id: heater
+    name: Heater
+    web_server:
+      sorting_group_id: grp_heat
+      sorting_weight: 1
+    # Not optimistic: the switch reports ON only when the heater output is actually energised.
+    # (Optimistic mode showed ON for a refused start until the 5 s interlock caught up.)
+    optimistic: false
+    restore_mode: ALWAYS_OFF
+    turn_on_action:
+      - lambda: |-
+          const float t = id(temperature).state;
+          const bool stale = (uint32_t) (millis() - id(last_climate_update)) > ${stale_sensor_s} * 1000UL;
+          if (isnan(t) || stale || id(hdc_heating) || t > ${max_safe_temp_f}) {   // refuse to heat without a trustworthy reading
+            ESP_LOGW("heater", "start refused: no trustworthy temperature reading");
+            id(heater).publish_state(false);
+            return;
+          }
+          // Manual control runs at full power, unless the blower is missing: never 100 % into still air.
+          if (!id(auto_writing)) id(heater_level) = id(blower_missing).state ? 0.22f : 1.0f;
+          id(heater_pwm).set_level(id(heater_level));
+          id(heater).publish_state(true);
+    turn_off_action:
+      - output.turn_off: heater_pwm
+      - lambda: id(heater).publish_state(false);
+    on_turn_off:
+      - lambda: |-
+          // Every way the heater stops (manual, safety cut-off, OTA, controller, self-test) ends up here.
+          // A stopped run restarts at the gentle 22 % stage.
+          id(heat_since) = 0; id(heat_full_since) = 0;
+          // If the airflow interlock raised the blower and nobody has touched it since, put it back.
+          if (!id(blower_raised)) return;
+          id(blower_raised) = false;
+          id(auto_writing) = true; id(blower_raising) = true;
+          if (id(blower_was_on)) id(blower).turn_on().set_speed(id(blower_was_speed)).perform();
+          else id(blower).turn_off().perform();
+          id(blower_raising) = false; id(auto_writing) = false;
+    on_turn_on:
+      - lambda: |-
+          // A person changed this control: pause automation so it doesn't fight them, and say why.
+          // Boot-time restores and the controller's own writes don't count.
+          if (id(auto_writing) || !id(booted) || !id(climate_control).state) return;
+          id(log_event).execute("manual Heater change: automation paused");
+          id(climate_control).turn_off();
+
+  - platform: gpio        # UV-C sterilising lamp hardware pin. Driven only by the uv_lamp switch (with
+    id: uv_c              # interlocks). Internal + ALWAYS_OFF so it is never energised at boot or directly.
+    internal: true
+    pin: GPIO18
+    restore_mode: ALWAYS_OFF
+
+  # Camera board power. The pin is internal; everything goes through the Camera Power switch below,
+  # which keeps the board unpowered for at least 10 s before switching it back on. Quick off/on cycles
+  # brown the camera out and can leave its OV2640 sensor wedged ("Got invalid frame from camera!",
+  # 2026-10-09). A soft reboot of the camera board doesn't clear that; only a real power cut does.
+  - platform: gpio
+    id: camera_power_pin
+    internal: true
+    pin: GPIO26
+    restore_mode: ALWAYS_OFF
+
+  - platform: template
+    id: camera_power
+    name: Camera Power
+    web_server:
+      sorting_group_id: grp_maint
+      sorting_weight: 3
+    restore_mode: RESTORE_DEFAULT_OFF   # off until the owner turns it on, then remembered across reboots
+    entity_category: config
+    lambda: return id(camera_power_pin).state;
+    turn_on_action:
+      - script.execute: camera_power_on
+    turn_off_action:
+      - script.stop: camera_power_on
+      - switch.turn_off: camera_power_pin
+      - lambda: id(camera_off_at) = millis();
+
+fan:
+  - platform: speed
+    id: fan_1
+    name: Fan 1
+    web_server:
+      sorting_group_id: grp_air
+      sorting_weight: 5
+    output: fan1_pwm
+    speed_count: 100
+    restore_mode: ALWAYS_OFF
+    on_speed_set:
+      - lambda: |-
+          // A person changed this control: pause automation so it doesn't fight them, and say why.
+          // Boot-time restores and the controller's own writes don't count.
+          if (id(auto_writing) || !id(booted) || !id(climate_control).state) return;
+          id(log_event).execute("manual Fan 1 change: automation paused");
+          id(climate_control).turn_off();
+    on_turn_on:
+      - lambda: |-
+          // A person changed this control: pause automation so it doesn't fight them, and say why.
+          // Boot-time restores and the controller's own writes don't count.
+          if (id(auto_writing) || !id(booted) || !id(climate_control).state) return;
+          id(log_event).execute("manual Fan 1 change: automation paused");
+          id(climate_control).turn_off();
+  - platform: speed
+    id: fan_2
+    name: Fan 2
+    web_server:
+      sorting_group_id: grp_air
+      sorting_weight: 6
+    output: fan2_pwm
+    speed_count: 100
+    restore_mode: ALWAYS_OFF
+    on_speed_set:
+      - lambda: |-
+          // A person changed this control: pause automation so it doesn't fight them, and say why.
+          // Boot-time restores and the controller's own writes don't count.
+          if (id(auto_writing) || !id(booted) || !id(climate_control).state) return;
+          id(log_event).execute("manual Fan 2 change: automation paused");
+          id(climate_control).turn_off();
+    on_turn_on:
+      - lambda: |-
+          // A person changed this control: pause automation so it doesn't fight them, and say why.
+          // Boot-time restores and the controller's own writes don't count.
+          if (id(auto_writing) || !id(booted) || !id(climate_control).state) return;
+          id(log_event).execute("manual Fan 2 change: automation paused");
+          id(climate_control).turn_off();
+  - platform: speed
+    id: blower
+    name: Blower
+    web_server:
+      sorting_group_id: grp_air
+      sorting_weight: 7
+    output: blower_pwm
+    speed_count: 100
+    restore_mode: ALWAYS_OFF
+    on_state:
+      - lambda: |-
+          // Anyone else changed the blower while the interlock had raised it: keep their setting.
+          if (!id(blower_raising)) id(blower_raised) = false;
+    on_speed_set:
+      - lambda: |-
+          // A person changed this control: pause automation so it doesn't fight them, and say why.
+          // Boot-time restores and the controller's own writes don't count.
+          if (id(auto_writing) || !id(booted) || !id(climate_control).state) return;
+          id(log_event).execute("manual Blower change: automation paused");
+          id(climate_control).turn_off();
+    on_turn_on:
+      - lambda: |-
+          // A person changed this control: pause automation so it doesn't fight them, and say why.
+          // Boot-time restores and the controller's own writes don't count.
+          if (id(auto_writing) || !id(booted) || !id(climate_control).state) return;
+          id(log_event).execute("manual Blower change: automation paused");
+          id(climate_control).turn_off();
+
+light:
+  # Mapping from the stock firmware (wrapper over Adafruit_NeoPixel, NEO_GRB + NEO_KHZ800):
+  #   Top Light    = 24 LEDs on GPIO5 in the removable tray. This is the GROW LIGHT. Stock app V26-V29.
+  #   Bottom Light = 64 LEDs on GPIO14 around the base rim. Stock app V30-V33.
+  # Stock exposed per light: on/off (V27/V31), brightness % (V28/V32), colour gradient (V26/V30),
+  # animation (V29/V33). Stock had no on-device light schedule; this firmware adds one (Light Hours).
+  - platform: esp32_rmt_led_strip
+    id: top_light
+    web_server:
+      sorting_group_id: grp_lights
+      sorting_weight: 1
+    name: Top Light
+    restore_mode: RESTORE_DEFAULT_OFF   # keep on/off, colour, brightness and effect across reboots
+    pin: GPIO5
+    num_leds: 24
+    chipset: WS2812
+    rgb_order: GRB
+    rmt_symbols: 64
+    default_transition_length: 1s
+    effects:
+      - pulse:
+          name: Breathe
+          transition_length: 2s
+          update_interval: 2s
+          min_brightness: 20%
+      - addressable_lambda:
+          # Grow-friendly dawn: warm red -> amber -> daylight white over one minute, then holds.
+          name: Sunrise
+          update_interval: 100ms
+          lambda: |-
+            static uint32_t start = 0;
+            if (initial_run) start = millis();
+            float p = std::min(1.0f, (millis() - start) / 60000.0f);
+            uint8_t r = 255, g = (uint8_t) (60 + 175 * p), b = (uint8_t) (10 + 200 * p * p);
+            it.all() = Color((uint8_t) (r * (0.2f + 0.8f * p)), (uint8_t) (g * (0.2f + 0.8f * p)), (uint8_t) (b * p));
+      - addressable_rainbow:
+          name: Rainbow
+      - addressable_scan:
+          name: Scan
+      - addressable_twinkle:
+          name: Twinkle
+  - platform: esp32_rmt_led_strip
+    id: bottom_light
+    web_server:
+      sorting_group_id: grp_lights
+      sorting_weight: 2
+    name: Bottom Light
+    restore_mode: RESTORE_DEFAULT_OFF   # keep on/off, colour, brightness and effect across reboots
+    # Fix for the dark strip: configured exactly like the Hackshroom build that lights it (ESPHome
+    # defaults: WS2812 chipset timing, GRB, 192 RMT symbols, default drive strength). The earlier
+    # hand-tuned timing (400/850/800/450 ns, 300 us reset, 40 mA, 256 symbols) left it dark.
+    # Source: analysis/hackshroom_comparison.md ("Base strip").
+    pin: GPIO14
+    num_leds: 64
+    chipset: WS2812
+    rgb_order: GRB
+    rmt_symbols: 192
+    default_transition_length: 1s
+    effects:
+      - addressable_lambda:
+          # Glanceable grow status on the base rim: green idle, blue humidifying, cyan topping up,
+          # amber incubating, orange heating, white fresh air, purple drying/purging, dim grey sensor dry pulse,
+          # red chase for low water or a sensor fault.
+          name: Status
+          update_interval: 60ms
+          lambda: |-
+            static uint16_t pos = 0;
+            const std::string s = id(grow_state).state;
+            bool alarm = s == "low_water" || s == "sensor_error";
+            if (alarm) {
+              it.all() = Color(20, 0, 0);
+              pos = (pos + 1) % it.size();
+              for (int i = 0; i < 6; i++) it[(pos + i) % it.size()] = Color(255, 0, 0);
+              return;
+            }
+            Color c = s == "humidifying"   ? Color(0, 90, 255)
+                    : s == "topping_up"    ? Color(0, 170, 220)
+                    : s == "heating"       ? Color(255, 110, 0)
+                    : s == "fresh_air"     ? Color(200, 200, 200)
+                    : s == "drying"        ? Color(160, 0, 200)
+                    : s == "purging"       ? Color(200, 0, 255)
+                    : s == "sensor_drying" ? Color(60, 60, 60)
+                    : s == "incubating"    ? Color(90, 40, 0)
+                    : Color(0, 180, 40);
+            float k = 0.55f + 0.45f * sinf(millis() / 1200.0f);
+            it.all() = Color((uint8_t) (c.r * k), (uint8_t) (c.g * k), (uint8_t) (c.b * k));
+      - pulse:
+          name: Breathe
+          transition_length: 2s
+          update_interval: 2s
+          min_brightness: 20%
+      - addressable_rainbow:
+          name: Rainbow
+      - addressable_color_wipe:
+          name: Color Wipe
+      - addressable_scan:
+          name: Scan
+      - addressable_twinkle:
+          name: Twinkle
+      - addressable_fireworks:
+          name: Fireworks
+
+number:
+  # Atomizer strength. Every mist pulse (automatic, manual, self-test) runs the atomizer at this
+  # share of full drive, to cut splashing. Stock had a variable atomizer duty too (Blynk V50).
+  # 100 % = the old behaviour. Below about 30 % the disc may not mist at all.
+  - platform: template
+    id: atomizer_power
+    name: Atomizer Power
+    icon: mdi:water-percent
+    unit_of_measurement: "%"
+    min_value: 30
+    max_value: 100
+    step: 5
+    optimistic: true
+    restore_value: true
+    initial_value: 100
+    entity_category: config
+    web_server:
+      sorting_group_id: grp_water
+      sorting_weight: 7
+    on_value:
+      - lambda: |-
+          id(atomizer_pwm).set_max_power(x / 100.0f);
+          // An atomizer that's already running picks up the new strength right away.
+          if (id(atomizer).state) id(atomizer_pwm).set_level(1.0f);
+          if (id(booted)) id(log_event).execute("Atomizer Power " + to_string((int) x) + "%");
+  # Atomizer seconds per humidify cycle. Stock ran 10 s; 6 s is the default since the pulsed mist phase
+  # (Mist Pulse On/Off + Mist Blower) wets the chamber more evenly, and 10 s pooled and splashed.
+  - platform: template
+    id: mist_burst
+    name: Mist Burst
+    icon: mdi:spray
+    unit_of_measurement: s
+    min_value: 3
+    max_value: 20
+    step: 1
+    optimistic: true
+    restore_value: true
+    initial_value: 6   # stock: 10
+    web_server:
+      sorting_group_id: grp_water
+      sorting_weight: 6
+  # Sub-pulses within the mist phase: Mist Pulse On seconds of atomizer, Mist Pulse Off seconds of rest,
+  # repeated until Mist Burst seconds of atomizer time have been delivered. Off = 0 runs the burst in one go.
+  - platform: template
+    id: mist_pulse_on
+    name: Mist Pulse On
+    icon: mdi:timer-play-outline
+    unit_of_measurement: s
+    min_value: 0.5
+    max_value: 5
+    step: 0.5
+    optimistic: true
+    restore_value: true
+    initial_value: 1.5
+    entity_category: config
+    web_server:
+      sorting_group_id: grp_water
+      sorting_weight: 6
+  - platform: template
+    id: mist_pulse_off
+    name: Mist Pulse Off
+    icon: mdi:timer-pause-outline
+    unit_of_measurement: s
+    min_value: 0
+    max_value: 5
+    step: 0.5
+    optimistic: true
+    restore_value: true
+    initial_value: 1.0
+    entity_category: config
+    web_server:
+      sorting_group_id: grp_water
+      sorting_weight: 6
+  # Blower speed during the mist phase (the blower phase that follows always runs at 100 %). 0 = still air,
+  # as stock did; some airflow carries the fog up instead of letting it fall back into the tray.
+  - platform: template
+    id: mist_blower
+    name: Mist Blower
+    icon: mdi:fan-auto
+    unit_of_measurement: "%"
+    min_value: 0
+    max_value: 100
+    step: 5
+    optimistic: true
+    restore_value: true
+    initial_value: 35
+    entity_category: config
+    web_server:
+      sorting_group_id: grp_water
+      sorting_weight: 6
+  # How long an atomizer a person switched on may run before it switches itself off.
+  - platform: template
+    id: manual_mist_limit
+    name: Manual Mist Limit
+    icon: mdi:timer-off-outline
+    unit_of_measurement: s
+    min_value: 5
+    max_value: 600
+    step: 5
+    optimistic: true
+    restore_value: true
+    initial_value: 60
+    entity_category: config
+    web_server:
+      sorting_group_id: grp_water
+      sorting_weight: 8
+  - platform: template
+    id: rh_soft_ceiling
+    name: RH Soft Ceiling
+    unit_of_measurement: "%"
+    min_value: 85
+    max_value: 97
+    step: 1
+    optimistic: true
+    restore_value: true
+    initial_value: 95
+    web_server:
+      sorting_group_id: grp_water
+      sorting_weight: 7
+  - platform: template
+    id: rh_soft_release
+    name: RH Soft Release
+    unit_of_measurement: "%"
+    min_value: 80
+    max_value: 96
+    step: 1
+    optimistic: true
+    restore_value: true
+    initial_value: 92
+    web_server:
+      sorting_group_id: grp_water
+      sorting_weight: 8
+  - platform: template
+    id: humidity_setpoint
+    name: Humidity Setpoint
+    web_server:
+      sorting_group_id: grp_grow
+      sorting_weight: 7
+    unit_of_measurement: "%"
+    min_value: 50
+    max_value: 99
+    step: 1
+    optimistic: true
+    restore_value: true
+    initial_value: 88
+    on_value:
+      - lambda: |-
+          // A hand edit makes the preset "Custom", but keeps the species' idle airflow (preset_auto_custom)
+          // and its pinning RH (species_pinning_rh).
+          if (id(applying_preset) || std::string(id(grow_preset).current_option()) == "Custom") return;
+          id(species_pinning_rh) = grow_climate::species_pinning_rh(std::string(id(grow_preset).current_option()).c_str());
+          id(preset_auto_custom) = true;
+          id(grow_preset).make_call().set_option("Custom").perform();
+          id(preset_auto_custom) = false;
+  - platform: template
+    id: temperature_setpoint
+    name: Temperature Setpoint
+    web_server:
+      sorting_group_id: grp_grow
+      sorting_weight: 6
+    unit_of_measurement: "°F"
+    min_value: 55
+    max_value: 85
+    step: 1
+    optimistic: true
+    restore_value: true
+    initial_value: 70
+    on_value:
+      - lambda: |-
+          if (id(heater_stalled).state) id(heater_stalled).publish_state(false);   // a new target: try again
+          if (id(applying_preset) || std::string(id(grow_preset).current_option()) == "Custom") return;
+          id(species_pinning_rh) = grow_climate::species_pinning_rh(std::string(id(grow_preset).current_option()).c_str());
+          id(preset_auto_custom) = true;
+          id(grow_preset).make_call().set_option("Custom").perform();
+          id(preset_auto_custom) = false;
+  - platform: template
+    id: fresh_air_interval
+    name: Fresh Air Interval
+    web_server:
+      sorting_group_id: grp_air
+      sorting_weight: 3
+    unit_of_measurement: min
+    min_value: 5
+    max_value: 240
+    step: 5
+    optimistic: true
+    restore_value: true
+    initial_value: 60
+  - platform: template
+    id: fresh_air_duration
+    name: Fresh Air Duration
+    web_server:
+      sorting_group_id: grp_air
+      sorting_weight: 4
+    unit_of_measurement: s
+    min_value: 10
+    max_value: 600
+    step: 10
+    optimistic: true
+    restore_value: true
+    initial_value: 60
+  - platform: template
+    id: light_hours
+    name: Light Hours
+    web_server:
+      sorting_group_id: grp_grow
+      sorting_weight: 8
+    unit_of_measurement: h
+    min_value: 0
+    max_value: 16
+    step: 1
+    optimistic: true
+    restore_value: true
+    initial_value: 12
+  - platform: template
+    id: light_start_hour      # the hour the light day begins (local time); Light Hours run from here
+    name: Light Start Hour
+    icon: mdi:weather-sunset-up
+    web_server:
+      sorting_group_id: grp_grow
+      sorting_weight: 8
+    unit_of_measurement: h
+    min_value: 0
+    max_value: 23
+    step: 1
+    optimistic: true
+    restore_value: true
+    initial_value: 8
+    entity_category: config
+  - platform: template
+    id: uv_minutes            # hard auto-off time for the UV-C lamp; bounds how long it can ever run
+    name: UV-C Auto-Off
+    icon: mdi:timer-off-outline
+    web_server:
+      sorting_group_id: grp_uvc
+      sorting_weight: 3
+    unit_of_measurement: min
+    min_value: 1
+    max_value: 60
+    step: 1
+    optimistic: true
+    restore_value: true
+    initial_value: 15
+    entity_category: config
+  # Grow phases (docs/grow-phases.md)
+  - platform: template
+    id: incubation_days
+    name: Incubation Days
+    icon: mdi:calendar-clock
+    unit_of_measurement: d
+    min_value: 1
+    max_value: 60
+    step: 1
+    optimistic: true
+    restore_value: true
+    initial_value: 14
+    web_server:
+      sorting_group_id: grp_grow
+      sorting_weight: 15
+  - platform: template
+    id: pinning_days
+    name: Pinning Days
+    icon: mdi:calendar-clock
+    unit_of_measurement: d
+    min_value: 1
+    max_value: 21
+    step: 1
+    optimistic: true
+    restore_value: true
+    initial_value: 5
+    web_server:
+      sorting_group_id: grp_grow
+      sorting_weight: 16
+  - platform: template
+    id: incubation_temperature
+    name: Incubation Temperature
+    unit_of_measurement: "°F"
+    min_value: 60
+    max_value: 82
+    step: 1
+    optimistic: true
+    restore_value: true
+    initial_value: 75
+    web_server:
+      sorting_group_id: grp_grow
+      sorting_weight: 17
+    on_value:
+      - lambda: |-   # a new target: try again
+          if (id(heater_stalled).state) id(heater_stalled).publish_state(false);
+  - platform: template
+    id: phase_snooze_days
+    name: Phase Snooze
+    icon: mdi:sleep
+    unit_of_measurement: d
+    min_value: 1
+    max_value: 7
+    step: 1
+    optimistic: true
+    restore_value: true
+    initial_value: 2
+    entity_category: config
+    web_server:
+      sorting_group_id: grp_grow
+      sorting_weight: 18
+
+# Preset setpoints are the stock firmware's real values (decoded from its preset IDs).
+select:
+  # Which fan blows fresh air IN. Bench 2026-10-03: Fan 1 (GPIO32) alone blows OUT, so Fan 2 (GPIO33) is the
+  # intake. Note Hackshroom's UI labels these the other way round ("FAN 1 - INTAKE"); the bench result wins.
+  - platform: template
+    id: intake_fan
+    name: Intake Fan
+    icon: mdi:fan-chevron-up
+    optimistic: true
+    restore_value: true
+    initial_option: Fan 2
+    options:
+      - Fan 1
+      - Fan 2
+    web_server:
+      sorting_group_id: grp_air
+      sorting_weight: 8
+  # How the firmware decides the tank is empty. Probe = the stock conductivity probe (GPIO15/23).
+  # Humidity Response = ignore the probe; a 5-min misting run that doesn't raise RH engages the Hard Stop.
+  # common/water-level-sensor.yaml (opt-in) adds "Level Sensor": a non-contact sensor, Humidity Response as backup.
+  - platform: template
+    id: water_sensing
+    name: Water Sensing
+    web_server:
+      sorting_group_id: grp_water
+      sorting_weight: 1
+    icon: mdi:water-check
+    optimistic: true
+    restore_value: true
+    initial_option: Probe
+    options:
+      - Probe
+      - Humidity Response
+  # Bench probe test (analysis/stock-control-loop.md §6): hold the probe drive (GPIO15) high or low
+  # instead of the stock 3 ms pulse, and change the pull on the sense pin (GPIO23), so the WATERLEVEL
+  # connector can be measured with a meter. Back to stock at boot and 5 min after the last change.
+  - platform: template
+    id: water_probe_drive_mode
+    name: Water Probe Drive
+    web_server:
+      sorting_group_id: grp_maint
+      sorting_weight: 2
+    icon: mdi:flash-triangle
+    entity_category: config
+    optimistic: true
+    restore_value: false
+    initial_option: Pulse (stock)
+    options:
+      - Pulse (stock)
+      - Held high
+      - Held low
+    on_value:
+      - lambda: |-
+          if (x == "Held high") id(water_probe_drive).turn_on(); else id(water_probe_drive).turn_off();
+          if (x != "Pulse (stock)") {
+            ESP_LOGW("water", "bench: probe drive %s (back to stock in 5 min)", x.c_str());
+            id(water_probe_test_timeout).execute();
+          }
+  - platform: template
+    id: water_probe_pull
+    name: Water Probe Pull
+    web_server:
+      sorting_group_id: grp_maint
+      sorting_weight: 3
+    icon: mdi:resistor
+    entity_category: config
+    optimistic: true
+    restore_value: false
+    initial_option: Pull-down (stock)
+    options:
+      - Pull-down (stock)
+      - None
+      - Pull-up
+    on_value:
+      - lambda: |-
+          if (x != "Pull-down (stock)") {
+            ESP_LOGW("water", "bench: GPIO23 pull %s (back to stock in 5 min)", x.c_str());
+            id(water_probe_test_timeout).execute();
+          }
+  - platform: template
+    id: fresh_air_mode
+    name: Fresh Air Mode
+    web_server:
+      sorting_group_id: grp_air
+      sorting_weight: 1
+    icon: mdi:fan
+    optimistic: true
+    restore_value: true
+    initial_option: Both fans
+    options:
+      - Both fans
+      - Alternate
+      - Two-phase
+  - platform: template
+    id: grow_preset
+    name: Grow Preset
+    web_server:
+      sorting_group_id: grp_grow
+      sorting_weight: 1
+    optimistic: true
+    restore_value: true
+    initial_option: Custom
+    options:
+      - Custom
+      - Shiitake
+      - Lion's Mane
+      - Reishi
+      - Pink Oyster
+      - Golden Oyster
+      - Blue Oyster
+      - Chestnut
+      - King Trumpet
+      - Italian Oyster
+      - Snow Oyster
+      - Black King
+      - Pioppino
+      - Nameko
+    on_value:
+      - lambda: |-
+          // Restored at boot: keep the restored setpoints (preset_to_apply returns nothing before boot), so a
+          // firmware update with new preset values never changes a running grow; only a new pick does.
+          if (!id(booted)) return;
+          // Values: common/grow_climate.h PRESETS (stock decoded values, aligned with the audited cloud
+          // recipes, docs/species-presets.md), plus the per-species idle airflow X.
+          const std::string pick(x);
+          const grow_climate::Preset *p = grow_climate::preset_to_apply(pick.c_str(), id(booted));
+          id(applying_preset) = true;
+          if (p != nullptr) {
+            id(temperature_setpoint).make_call().set_value(p->temp_f).perform();
+            id(humidity_setpoint).make_call().set_value(p->rh).perform();
+            id(idle_airflow) = p->airflow;
+          }
+          // Picking Custom by hand goes back to the stock idle airflow and the old pinning rule. A setpoint
+          // nudge that switches the preset to Custom on the owner's behalf keeps the species' airflow and
+          // pinning RH (preset_auto_custom).
+          if (pick == "Custom" && !id(preset_auto_custom)) {
+            id(idle_airflow) = 7;   // stock default
+            id(species_pinning_rh) = 0;
+          }
+          id(applying_preset) = false;
+
+  # Grow phases (docs/grow-phases.md). Fruiting is the default, so a grow started without touching this
+  # behaves exactly like before phases existed (blocks bought already colonised go straight to fruiting).
+  - platform: template
+    id: grow_phase
+    name: Grow Phase
+    icon: mdi:sprout-outline
+    optimistic: true
+    restore_value: true
+    initial_option: Fruiting
+    options:
+      - Incubation
+      - Pinning
+      - Fruiting
+    web_server:
+      sorting_group_id: grp_grow
+      sorting_weight: 11
+    on_value:
+      - lambda: |-
+          if (!id(booted)) return;   // restored at boot: keep the saved phase clock
+          auto now = id(sntp_time).now();
+          id(phase_start) = now.is_valid() ? now.timestamp : 0;   // 0: the phase check sets it once time syncs
+          id(phase_snooze_until) = 0;
+          id(camera_stage_at) = 0;     // an observation from the old phase shouldn't fire the new phase's question
+          id(phase_next) = "";
+          id(phase_check).publish_state(false);
+          id(phase_question).publish_state("");
+          id(next_fresh_air) = 0;      // reschedule fresh air at this phase's interval
+          id(light_sched_on) = -1;     // re-apply the light schedule (incubation is dark) on the next minute
+          id(log_event).execute("phase: " + x);
+          id(phase_day).update();
+  # Ask me (default): raise Phase Check and wait for Advance Phase / Not Yet. Automatic: switch phase by
+  # itself. Manual: count days only.
+  - platform: template
+    id: phase_advance
+    name: Phase Advance
+    icon: mdi:debug-step-over
+    optimistic: true
+    restore_value: true
+    initial_option: Ask me
+    options:
+      - Ask me
+      - Automatic
+      - Manual
+    entity_category: config
+    web_server:
+      sorting_group_id: grp_grow
+      sorting_weight: 14
+  # What a camera check last saw. Written by Home Assistant (homeassistant/blueprints) or another vision job,
+  # never by the firmware. Only a reading from the last 36 h counts.
+  - platform: template
+    id: camera_stage
+    name: Camera Stage
+    icon: mdi:camera-iris
+    optimistic: true
+    restore_value: true
+    initial_option: Unknown
+    options:
+      - Unknown
+      - Colonizing
+      - Colonized
+      - Pinning
+      - Fruiting
+    web_server:
+      sorting_group_id: grp_grow
+      sorting_weight: 19
+    on_value:
+      - lambda: |-
+          if (!id(booted)) return;
+          auto now = id(sntp_time).now();
+          id(camera_stage_at) = (now.is_valid() && x != "Unknown") ? now.timestamp : 0;
+          static std::string last;
+          if (x != last) { last = x; id(log_event).execute("camera: " + x); }
+
+text:
+  - platform: template
+    id: grow_name
+    name: Grow Name
+    icon: mdi:mushroom
+    mode: text
+    max_length: 40
+    optimistic: true
+    restore_value: true
+    initial_value: ""
+    web_server:
+      sorting_group_id: grp_grow
+      sorting_weight: 0
+
+text_sensor:
+  - platform: template
+    id: clock_source
+    name: Time Source   # sntp / held / rtc / none (common/time_source.h, docs/time-and-schedule.md)
+    icon: mdi:clock-check-outline
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: |-
+      return std::string(time_source::classify(id(sntp_time).now().is_valid(), id(time_synced_at), millis(), id(time_from_rtc)));
+    web_server:
+      sorting_group_id: grp_health
+      sorting_weight: 9
+  - platform: template
+    id: firmware_version
+    name: Firmware Version   # esphome.project.version; published on boot
+    icon: mdi:chip
+    entity_category: diagnostic
+    update_interval: never
+    web_server:
+      sorting_group_id: grp_health
+      sorting_weight: 8
+  - platform: template
+    id: event_log
+    name: Event Log
+    icon: mdi:format-list-bulleted
+    entity_category: diagnostic
+    update_interval: never
+    web_server:
+      sorting_group_id: grp_health
+      sorting_weight: 7
+  - platform: template
+    id: grow_state
+    name: Grow State
+    web_server:
+      sorting_group_id: grp_grow
+      sorting_weight: 3
+  - platform: template
+    id: phase_question    # the question Phase Check asks; empty when there's none
+    name: Phase Question
+    icon: mdi:chat-question-outline
+    web_server:
+      sorting_group_id: grp_grow
+      sorting_weight: 13
+  - platform: template
+    id: mist_status
+    name: Mist Status
+    icon: mdi:weather-fog
+    web_server:
+      sorting_group_id: grp_water
+      sorting_weight: 0
+  - platform: template
+    id: self_test_result
+    name: Self-Test Result
+    web_server:
+      sorting_group_id: grp_health
+      sorting_weight: 6
+    entity_category: diagnostic
+
+button:
+  - platform: template
+    id: btn_start_grow   # pressed by remote commands too (remote-access.yaml)
+    name: Start Grow
+    icon: mdi:sprout
+    on_press:
+      - lambda: |-
+          auto now = id(sntp_time).now();
+          if (!now.is_valid()) { ESP_LOGW("grow", "time not synced yet; try again in a minute"); return; }
+          id(grow_start) = now.timestamp;
+          id(phase_start) = now.timestamp;   // the selected Grow Phase starts with the grow
+          id(phase_snooze_until) = 0;
+          id(camera_stage_at) = 0;
+          id(climate_control).turn_on();
+          id(log_event).execute("grow started: " + id(grow_name).state + " (" + std::string(id(grow_preset).current_option()) + ")");
+          id(grow_day).update();
+      - script.execute: save_now
+    web_server:
+      sorting_group_id: grp_grow
+      sorting_weight: 9
+  - platform: template
+    id: btn_end_grow   # pressed by remote commands too (remote-access.yaml)
+    name: End Grow
+    icon: mdi:flag-checkered
+    # Ends the grow and leaves the chamber idle: the day count stops, Climate Control turns off and the
+    # mister, heater, fans and blower switch off (lights and UV-C are left alone). With no grow running
+    # it does nothing, so a repeated press doesn't fill the event log.
+    on_press:
+      - if:
+          condition:
+            lambda: return id(grow_start) != 0;
+          then:
+            - lambda: |-
+                id(log_event).execute("grow ended: " + id(grow_name).state);
+                id(grow_start) = 0;
+                id(grow_paused) = false;
+                id(grow_day).update();
+            - switch.turn_off: climate_control
+            - script.execute: save_now
+            - lambda: |-
+                id(auto_writing) = true;
+                id(atomizer).turn_off(); id(heater).turn_off();
+                id(fan_1).turn_off().perform(); id(fan_2).turn_off().perform(); id(blower).turn_off().perform();
+                id(auto_writing) = false;
+    web_server:
+      sorting_group_id: grp_grow
+      sorting_weight: 10
+  # Answers to Phase Check. Advance Phase also works with no question open: it steps to the next phase.
+  - platform: template
+    id: btn_advance_phase   # pressed by remote commands too (remote-access.yaml)
+    name: Advance Phase
+    icon: mdi:skip-next
+    on_press:
+      - lambda: |-
+          const std::string cur = id(grow_phase).current_option();
+          std::string next = id(phase_next);
+          if (next.empty()) next = cur == "Incubation" ? "Pinning" : "Fruiting";
+          if (next == cur) return;
+          id(log_event).execute(std::string(id(phase_check).state ? "answered yes: " : "advance: ") + cur + " -> " + next);
+          id(grow_phase).make_call().set_option(next).perform();
+    web_server:
+      sorting_group_id: grp_grow
+      sorting_weight: 13
+  - platform: template
+    id: btn_not_yet   # pressed by remote commands too (remote-access.yaml)
+    name: Not Yet
+    icon: mdi:sleep
+    on_press:
+      - lambda: |-
+          if (!id(phase_check).state) return;
+          auto now = id(sntp_time).now();
+          if (!now.is_valid()) return;
+          const uint32_t days = (uint32_t) id(phase_snooze_days).state;
+          id(phase_snooze_until) = now.timestamp + days * 86400UL;
+          id(camera_stage_at) = 0;   // the camera must see it again after the snooze
+          id(phase_next) = "";
+          id(phase_check).publish_state(false);
+          id(phase_question).publish_state("");
+          id(log_event).execute("answered not yet: ask again in " + to_string(days) + " d");
+    web_server:
+      sorting_group_id: grp_grow
+      sorting_weight: 13
+  - platform: restart
+    name: Restart
+    web_server:
+      sorting_group_id: grp_maint
+      sorting_weight: 4
+  - platform: template
+    id: btn_fresh_air_now   # pressed by remote commands too (remote-access.yaml)
+    name: Fresh Air Now
+    web_server:
+      sorting_group_id: grp_air
+      sorting_weight: 2
+    icon: mdi:weather-windy
+    on_press:
+      - lambda: |-
+          // Ignored while an exchange is already running (Hackshroom: FAE Now disabled mid-cycle).
+          if ((int32_t) (id(fresh_air_until) - millis()) > 0) return;
+          id(next_fresh_air) = millis() | 1;   // next controller tick starts an exchange (0 would mean "unscheduled")
+  - platform: template
+    name: Sensor Dry Pulse
+    web_server:
+      sorting_group_id: grp_maint
+      sorting_weight: 2
+    icon: mdi:water-thermometer
+    entity_category: diagnostic
+    on_press:
+      - script.execute: hdc_dry_pulse
+  - platform: template
+    name: Run Self-Test
+    web_server:
+      sorting_group_id: grp_health
+      sorting_weight: 5
+    entity_category: diagnostic
+    on_press:
+      - script.execute: self_test

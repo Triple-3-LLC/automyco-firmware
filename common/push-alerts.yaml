@@ -1,0 +1,267 @@
+# Push alerts: the chamber tells automyco.com when something needs the owner, and automyco.com forwards it
+# to the owner's iPhone (APNs). Opt-in: the "Push Alerts" switch is OFF until the owner turns it on.
+# Flow, privacy and server side: docs/push-alerts.md. Needs common/cloud-identity.yaml (ID, token and
+# the shared cloud_http client).
+#
+#   packages:
+#     push_alerts: !include common/push-alerts.yaml
+#
+# What it sends (POST ${cloud_base_url}/api/device/alert, {kind, message, gday?, ts}):
+#   tank_empty          Tank Empty Alert came on (Humidity Response sensing engaged the Hard Stop)
+#   low_water           Low Water came on (and it isn't the Tank Empty Alert, which says more)
+#   atomizer_hard_stop  the Atomizer Hard Stop came on for any other reason
+#   heater_fault        Heater Fault came on: the heater is cut by a sensor fault, over-temperature or a stall
+#   grow_milestone      Grow Day reached 1, 7, 14 or 21 (each once per grow, kept across reboots)
+#   test                the Test Push Alert button
+#   hello               Push Alerts switched on: a silent check-in, so the server knows the chamber
+#                       before the app registers for it
+#   load_missing        a load check reported a fan, the blower, the atomizer or the heater Not Detected
+#                       (after a 5-min boot grace, so the boot self-test's result goes out once)
+#   sensor_stuck        temperature AND humidity haven't moved more than 0.05 for 2 h with Climate Control on
+#                       (a sensor dry pulse restarts the wait)
+#   climate_out_of_band temperature (±5 °F) or humidity (±10 %) has been outside its target for 3 h with
+#                       Climate Control on (humidity isn't judged during Incubation, which adds no moisture)
+# Only rising edges count, and a condition that's already on at boot is a baseline, not an alert.
+# The same problem kind goes out at most once per 30 min (the server applies its own limit too).
+#
+# Never blocks the controller: the POST runs in its own FreeRTOS task (push_alerts.h). At most one alert
+# is in flight; the rest wait in a bitmask queue, one per kind. A failed send is retried with backoff
+# (1, 2, 4, 8 min) and dropped after 5 tries. Nothing is queued while the switch is off.
+
+esphome:
+  includes:
+    - push_alerts.h
+    - common/push_conditions.h   # sensor_stuck / climate_out_of_band timing (tests/test_push_conditions.cpp)
+
+globals:
+  - id: push_pending          # bit per kind (see PUSH_KINDS below) waiting to be sent
+    type: uint32_t
+    initial_value: "0"
+  - id: push_last_sent        # millis() of the last accepted send per kind; 0 = never
+    type: std::array<uint32_t, 12>
+    initial_value: 'std::array<uint32_t, 12>{}'
+  - id: push_sensor_t         # readings the sensor_stuck wait is measured from, and when it started (push_conditions.h)
+    type: float
+    initial_value: "NAN"
+  - id: push_sensor_h
+    type: float
+    initial_value: "NAN"
+  - id: push_sensor_changed   # millis() the wait started (0 = no reading yet; stored | 1)
+    type: uint32_t
+    initial_value: "0"
+  - id: push_inband_at        # millis() the climate was last inside its bands, or not being judged (stored | 1)
+    type: uint32_t
+    initial_value: "0"
+  - id: push_prev_flags       # last sampled conditions; bit 31 set = not sampled yet (baseline)
+    type: uint32_t
+    initial_value: "0x80000000"
+  - id: push_milestone_sent   # last Grow Day milestone sent (0 = none this grow); saved, so a reboot doesn't repeat it
+    type: int
+    restore_value: true
+    initial_value: "0"
+  - id: push_milestone_day    # the milestone day waiting in the queue
+    type: int
+    initial_value: "0"
+  - id: push_inflight         # kind being sent, -1 = none
+    type: int
+    initial_value: "-1"
+  - id: push_fails            # consecutive failures of the alert at the head of the queue
+    type: int
+    initial_value: "0"
+  - id: push_retry_at         # millis() before which nothing is sent (backoff)
+    type: uint32_t
+    initial_value: "0"
+
+switch:
+  - platform: template
+    id: push_alerts
+    name: Push Alerts
+    icon: mdi:cellphone-message
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF   # opt-in: nothing leaves the chamber until the owner turns it on
+    entity_category: config
+    on_turn_on:
+      - lambda: |-
+          id(push_pending) |= 1u << 6;   // "hello", a silent check-in with the server
+      - script.execute: { id: log_event, msg: "push alerts on" }
+    on_turn_off:
+      - lambda: id(push_pending) = 0;
+      - script.execute: { id: log_event, msg: "push alerts off" }
+    web_server:
+      sorting_group_id: grp_health
+      sorting_weight: 20
+
+button:
+  - platform: template
+    name: Test Push Alert
+    icon: mdi:bell-ring-outline
+    entity_category: diagnostic
+    on_press:
+      - lambda: |-
+          if (!id(push_alerts).state) { ESP_LOGW("push", "test ignored: Push Alerts is off"); return; }
+          id(push_pending) |= 1u << 5;
+    web_server:
+      sorting_group_id: grp_health
+      sorting_weight: 21
+
+binary_sensor:
+  # The heater is (or would be) held off by the controller's safety interlock: the HDC1080 reading is
+  # missing or stale, or the chamber is above max_safe_temp_f. Mirrors the interlock in
+  # terrashroom-core.yaml without changing it. A dry pulse pauses readings by design, so it isn't a fault.
+  - platform: template
+    id: heater_fault
+    name: Heater Fault
+    device_class: problem
+    icon: mdi:radiator-off
+    lambda: |-
+      if (millis() < 120000UL) return false;   // first readings after boot
+      if (id(heater_stalled).state) return true;   // 45 min at 100 % went nowhere: the controller cut it
+      const float t = id(temperature).state, h = id(humidity).state;
+      if (!isnan(t) && t > ${max_safe_temp_f}) return true;
+      if (id(hdc_heating)) return false;
+      const bool stale = (uint32_t) (millis() - id(last_climate_update)) > ${stale_sensor_s} * 1000UL;
+      return isnan(t) || isnan(h) || stale;
+    filters:
+      - delayed_on: 30s    # a single missed reading is not worth a push
+    web_server:
+      sorting_group_id: grp_heat
+      sorting_weight: 9
+
+interval:
+  - interval: 1s
+    then:
+      - lambda: |-
+          // Kind index -> wire name. Bit n of push_pending is PUSH_KINDS[n]; lower bits go first.
+          static const char *const PUSH_KINDS[] = {"tank_empty", "low_water", "atomizer_hard_stop", "heater_fault",
+                                                   "grow_milestone", "test", "hello",
+                                                   "load_missing", "sensor_stuck", "climate_out_of_band"};
+          const uint32_t now = millis();
+          const bool on = id(push_alerts).state;
+          auto queue = [&](int k) {
+            if (!on) return;
+            const uint32_t last = id(push_last_sent)[k];
+            const bool problem = k <= 3 || k >= 7;
+            if (problem && last != 0 && (uint32_t) (now - last) < 30UL * 60000UL) return;   // 30 min per kind
+            id(push_pending) |= 1u << k;
+          };
+
+          // Conditions behind the three slow alerts.
+          const float t = id(temperature).state, h = id(humidity).state;
+          const bool climate_on = id(climate_control).state;
+          // load_missing: any Not Detected flag, once the boot self-test has had its say (5 min).
+          const bool any_missing = id(fan_1_missing).state || id(fan_2_missing).state || id(blower_missing).state ||
+                                   id(atomizer_missing).state || id(heater_missing).state;
+          const bool load_missing = any_missing && now > 5UL * 60000UL;
+          // sensor_stuck: neither reading has moved more than 0.05 for 2 h while the controller relies on them.
+          const bool sensor_stuck = push_cond::sensor_stuck(id(push_sensor_t), id(push_sensor_h), id(push_sensor_changed),
+                                                            now, t, h, climate_on, id(hdc_heating));
+          // climate_out_of_band: 3 h outside temperature ±5 °F or humidity ±10 % of the target in force.
+          const bool incubating = std::string(id(grow_phase).current_option()) == "Incubation";
+          const float ts = incubating ? id(incubation_temperature).state : id(temperature_setpoint).state;
+          const float hs = grow_climate::humidity_target(  // the controller's target (common/grow_climate.h)
+              grow_climate::phase_from(std::string(id(grow_phase).current_option()).c_str()), id(humidity_setpoint).state,
+              grow_climate::pinning_rh_for(std::string(id(grow_preset).current_option()).c_str(), id(species_pinning_rh)));
+          const bool t_out = !isnan(t) && !isnan(ts) && fabsf(t - ts) > 5.0f;
+          const bool h_out = !incubating && !isnan(h) && !isnan(hs) && fabsf(h - hs) > 10.0f;
+          const bool out_of_band = push_cond::out_of_band(id(push_inband_at), now,
+                                                          climate_on && !id(hdc_heating) && !isnan(t) && !isnan(h) && (t_out || h_out));
+
+          // 1. Edges. Sampled even while off, so switching on doesn't report an old condition.
+          const uint32_t flags = (id(tank_empty_alert).state ? 1u : 0u) | (id(low_water).state ? 2u : 0u) |
+                                 (id(atomizer_hard_stop).state ? 4u : 0u) | (id(heater_fault).state ? 8u : 0u) |
+                                 (load_missing ? 16u : 0u) | (sensor_stuck ? 32u : 0u) | (out_of_band ? 64u : 0u);
+          const uint32_t prev = id(push_prev_flags);
+          id(push_prev_flags) = flags;
+          if (!(prev & 0x80000000u)) {
+            const uint32_t rose = flags & ~prev;
+            if (rose & 1u) queue(0);
+            // Low Water and the Hard Stop also come on with a Tank Empty Alert; one push says it all.
+            if ((rose & 2u) && !(flags & 1u)) queue(1);
+            if ((rose & 4u) && !(flags & 1u)) queue(2);
+            if (rose & 8u) queue(3);
+            if (rose & 16u) queue(7);
+            if (rose & 32u) queue(8);
+            if (rose & 64u) queue(9);
+          }
+
+          // 2. Grow Day milestones (once each per grow; End Grow resets).
+          if (id(grow_start) == 0) {
+            id(push_milestone_sent) = 0;
+          } else if (!isnan(id(grow_day).state)) {
+            const int day = (int) id(grow_day).state;
+            if ((day == 1 || day == 7 || day == 14 || day == 21) && day != id(push_milestone_sent)) {
+              id(push_milestone_sent) = day;
+              if (on) { id(push_milestone_day) = day; queue(4); }
+            }
+          }
+
+          if (!on) { id(push_pending) = 0; }
+
+          // 3. Collect the result of the alert in flight.
+          if (id(push_inflight) >= 0) {
+            const int st = ts01_push_status;
+            if (st == 1) return;   // still running
+            ts01_push_status = 0;
+            const int k = id(push_inflight);
+            id(push_inflight) = -1;
+            if (st >= 200 && st < 300) {
+              id(push_last_sent)[k] = now == 0 ? 1 : now;
+              id(push_pending) &= ~(1u << k);
+              id(push_fails) = 0;
+              ESP_LOGI("push", "%s sent", PUSH_KINDS[k]);
+            } else if (st >= 400 && st < 500) {
+              // The server refused it (bad token, bad request): retrying won't help.
+              id(push_pending) &= ~(1u << k);
+              id(push_fails) = 0;
+              ESP_LOGW("push", "%s refused: HTTP %d", PUSH_KINDS[k], st);
+            } else {
+              id(push_fails) += 1;
+              ESP_LOGW("push", "%s failed (HTTP %d), try %d", PUSH_KINDS[k], st, id(push_fails));
+              if (id(push_fails) >= 5) { id(push_pending) &= ~(1u << k); id(push_fails) = 0; }
+              else id(push_retry_at) = now + (60000UL << (id(push_fails) - 1));
+            }
+            return;
+          }
+
+          // 4. Start the next one.
+          if (id(push_pending) == 0 || (int32_t) (now - id(push_retry_at)) < 0) return;
+          if (!wifi::global_wifi_component->is_connected()) return;
+          if (strnlen(id(cloud_device_id).data(), 33) != 32) return;   // identity not made yet
+          const int k = __builtin_ctz(id(push_pending));
+
+          char msg[180] = "";
+          if (k == 3) {
+            if (id(heater_stalled).state)
+              snprintf(msg, sizeof(msg), "The heater ran at full power for 45 minutes without warming the chamber, so it is off. Check the heater, the door and the room.");
+            else if (!isnan(t) && t > ${max_safe_temp_f})
+              snprintf(msg, sizeof(msg), "The chamber is at %.0f °F, above the ${max_safe_temp_f} °F cut-off, so the heater is off. Check the room and the vents.", t);
+            else
+              snprintf(msg, sizeof(msg), "The temperature and humidity sensor stopped reporting, so the heater is off until it recovers.");
+          } else if (k == 7) {
+            std::string which;
+            const char *names[5] = {"Fan 1", "Fan 2", "the blower", "the atomizer", "the heater"};
+            binary_sensor::BinarySensor *flags[5] = {id(fan_1_missing), id(fan_2_missing), id(blower_missing), id(atomizer_missing), id(heater_missing)};
+            for (int i = 0; i < 5; i++) if (flags[i]->state) which += (which.empty() ? "" : ", ") + std::string(names[i]);
+            snprintf(msg, sizeof(msg), "The chamber switched on %s but saw no current: unplugged or broken? Check the connector.", which.c_str());
+          } else if (k == 8) {
+            snprintf(msg, sizeof(msg), "Temperature and humidity have stayed at %.1f °F / %.1f %% for 2 hours. The sensor may be stuck; the controller is flying blind.", t, h);
+          } else if (k == 9) {
+            snprintf(msg, sizeof(msg), "The chamber has been at %.0f °F / %.0f %% for 3 hours, away from its %.0f °F / %.0f %% target. Check the heater, mister and water.", t, h, ts, hs);
+          } else if (k == 4) {
+            const std::string name = id(grow_name).state.empty() ? std::string(id(grow_preset).current_option()) : id(grow_name).state;
+            if (id(push_milestone_day) == 1) snprintf(msg, sizeof(msg), "%s is under way. Next updates on days 7, 14 and 21.", name.c_str());
+            else snprintf(msg, sizeof(msg), "%s is on day %d.", name.c_str(), id(push_milestone_day));
+          }
+          auto clock = id(sntp_time).now();
+          const std::string body = json::build_json([&](JsonObject root) {
+            root["kind"] = PUSH_KINDS[k];
+            if (msg[0]) root["message"] = msg;
+            if (k == 4) root["gday"] = id(push_milestone_day);
+            if (clock.is_valid()) root["ts"] = (uint32_t) clock.timestamp;
+          });
+          if (ts01_push_post_async(id(cloud_http), "${cloud_base_url}/api/device/alert", body,
+                                   id(cloud_device_id).data(), id(cloud_device_token).data())) {
+            id(push_inflight) = k;
+          } else {
+            id(push_retry_at) = now + 30000UL;   // busy or short of heap: try again shortly
+          }

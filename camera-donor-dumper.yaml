@@ -1,0 +1,86 @@
+# Donor camera stock-firmware dumper: a tiny, read-only build for a TS-01 camera board that is STILL
+# ON STOCK (camera/0.1.7.09). It copies the stock camera image off the board over Wi-Fi, with no case
+# opening and no serial adapter. Full procedure: docs/camera-donor-dump.md.
+#
+#   esphome compile camera-donor-dumper.yaml        # needs no secrets.yaml
+#
+# How it works:
+#   1. The donor's chamber (AutoMyco main-board firmware 1.1.0+) installs this image through the
+#      camera's OWN stock updater (Camera Install = "dumper-1 <sha256 of this image>"). The stock
+#      updater writes the camera's inactive app slot and leaves the stock image in the other one.
+#   2. This firmware boots from the new slot, gets Wi-Fi from the chamber over the camera link (the
+#      stock {"ssid","password"} handover), and serves the OTHER slot, read-only, behind HTTP Basic:
+#        http://<camera>/dump/info   partition table, image length, SHA-256 computed on the camera
+#        http://<camera>/dump/app    the stock image, trimmed to its exact length
+#   3. tools/verify_camera_dump.py downloads it twice and only calls it good if it hashes to the
+#      known stock SHA-256 (127772ee...5903) and esptool accepts it.
+#
+# Install it ONLY through the stock updater on a stock camera. Never OTA it onto a camera that already
+# runs ESPHome: ESPHome OTA writes the inactive slot, which on such a camera holds the stock image.
+#
+# Login: user `dumper`, a random password generated per build. `esphome compile` prints it and writes
+# it to .esphome/build/automyco-camera-dumper/flash_dumper_password.txt. Every rebuild changes it (and
+# the image hash).
+#
+# OTA: compiled in (so the donor can afterwards restore stock or move on to the AutoMyco camera build)
+# but LOCKED at boot with a random password. POST /dump/ota-unlock opens it with the dumper password,
+# and only if the dump slot hashes to the stock SHA-256 (?force=1 overrides; see the doc). Then:
+#   esphome -s ota_upload_password <password> upload camera-donor-dumper.yaml --device <camera> --file <bin>
+#
+# Same board and UART as camera.yaml / common/camera-core.yaml (AI-Thinker ESP32-CAM layout, UART0 =
+# camera link at 115200). No camera, PSRAM, web_server or native API: nothing here touches the sensor.
+
+substitutions:
+  name: automyco-camera-dumper
+  dumper_version: dumper-1     # reported as automyco-camera/dumper-1; Camera Install takes "dumper-1 <sha>"
+  ota_upload_password: ""      # leave empty when compiling; pass with -s only for `esphome upload`
+
+esphome:
+  name: ${name}
+  friendly_name: AutoMyco Camera Dumper
+  name_add_mac_suffix: true
+  build_path: build/automyco-camera-dumper   # relative to .esphome/
+
+esp32:
+  board: esp32cam
+  framework:
+    type: esp-idf
+    advanced:
+      # No bootloader rollback handling: nothing in this build may touch otadata on its own (the stock
+      # bootloader is too old for rollback anyway: "Bootloader too old for OTA rollback", LOG.md).
+      enable_ota_rollback: false
+
+logger:
+  baud_rate: 115200   # UART0 = the camera link to the main board; stock's 115200
+  level: INFO
+
+# A boot loop must not fall into safe mode: safe mode skips flash_dumper's setup, which is what locks
+# OTA. Without it, a broken boot simply stays broken and the stock slot stays untouched.
+safe_mode:
+  disabled: true
+
+wifi:
+  # Wi-Fi only ever comes from the chamber over the camera link (flash_dumper chamber_link_version),
+  # saved in NVS, and then takes priority over this placeholder. No access point, no Improv (Improv
+  # would compete with the camera link for UART0).
+  networks:
+    - ssid: automyco-camera-awaiting-chamber
+  power_save_mode: none   # the stock firmware's Wi-Fi was poor on this board; give the transfer every chance
+
+ota:
+  - platform: esphome
+    id: ota_main
+    password: "${ota_upload_password}"   # compiles in the auth check; flash_dumper locks it at boot
+
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [flash_dumper]
+
+flash_dumper:
+  port: 80
+  # password: omitted on purpose -> a random one per build (printed by `esphome compile`)
+  expected_sha256: 127772ee59465bd48df0588d2effdbc7299818891c583f432707d17f32ba5903   # camera/0.1.7.09
+  ota_id: ota_main
+  chamber_link_version: ${dumper_version}

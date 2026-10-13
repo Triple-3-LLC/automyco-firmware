@@ -1,0 +1,160 @@
+# The camera board's hardware and its link to the main board, shared by the personal build
+# (camera.yaml) and the public build (camera-public.yaml). Both builds include this file unchanged;
+# they differ only in how the camera gets its Wi-Fi, logins and keys.
+#
+# The board's UART0 is wired to the main board's Serial2 (GPIO16/17, confirmed 2026-10-03), so the
+# main board sees this firmware's log output and talks to it over the same line (chamber_link); the
+# main board powers this board via GPIO26.
+
+substitutions:
+  name: automyco-camera      # automyco-camera-a1b2c3 (was terrashroom-camera-a1b2c3 before 2026-10-09)
+  friendly_name: AutoMyco Camera
+  camera_version: "1.2.0"    # reported to the main board as automyco-camera/<version>; = project.version
+  provisioning_window: 30min # how long after the camera boots its login can be claimed
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  name_add_mac_suffix: true
+  project:
+    name: community.automyco-camera
+    version: ${camera_version}
+  on_boot:   # a list, so each build can add its own entries
+    # Before web_server starts serving: the claimed login, or a random lock while unclaimed. The
+    # placeholder login in web_server below is public, so it must never be the live one.
+    - priority: 800
+      then:
+        - lambda: id(camera_web)->load_login();
+
+esp32:
+  board: esp32cam
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      # The image's app descriptor carries camera_version (otherwise it's the ESPHome version), so an
+      # updating camera can check what it downloaded is newer (camera_update image_verdict).
+      CONFIG_APP_PROJECT_VER_FROM_CONFIG: y
+      CONFIG_APP_PROJECT_VER: '"${camera_version}"'
+
+psram:
+
+logger:
+  baud_rate: 115200   # UART0 = link to the main board; keep it at stock's 115200
+  level: INFO
+
+# Backstop for a board that's awkward to reach: if a flash boot-loops, fall back to Wi-Fi + OTA only
+# so a corrected image can always be pushed over the air.
+safe_mode:
+  reboot_timeout: 10min
+  num_attempts: 5
+
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [camera_http, chamber_link, camera_update]
+
+# Pin map confirmed on the TS-01's green camera PCB (2026-10-09): the AI-Thinker ESP32-CAM layout.
+esp32_camera:
+  id: chamber_camera
+  name: Chamber Camera
+  external_clock:
+    pin: GPIO0
+    frequency: 20MHz
+  i2c_pins:
+    sda: GPIO26
+    scl: GPIO27
+  data_pins: [GPIO5, GPIO18, GPIO19, GPIO21, GPIO36, GPIO39, GPIO34, GPIO35]
+  vsync_pin: GPIO25
+  href_pin: GPIO23
+  pixel_clock_pin: GPIO22
+  power_down_pin: GPIO32
+  resolution: 1600x1200      # stock used "higher resolution" when PSRAM is present
+  jpeg_quality: 12
+  max_framerate: 10 fps
+  idle_framerate: 0.1 fps
+
+# Everything on this board is password-protected (HTTP Basic):
+#   - REST/SSE API on :80 (Camera Flash, counters): web_server auth
+#   - Live MJPEG  http://<camera>:8080/stream  and snapshot  http://<camera>:8080/snapshot:
+#     our camera_http component (ESPHome's built-in camera web server has no auth, so it's not used)
+# One login covers both, and nobody types it: the iOS app claims a random one through
+# POST :8080/claim within provisioning_window of the camera's boot, keeps it in the iCloud Keychain,
+# and the camera saves it in flash. Until then every endpoint is locked with a random login. To pair
+# again (new phone, lost login): power-cycle the chamber, then the app's Pair Camera (the chamber's
+# Camera Reset Login). Threat model: docs/camera-install.md. OTA is native + password only.
+web_server:
+  port: 80
+  version: 3
+  ota: false
+  # Placeholder: replaced at the start of boot (on_boot priority 800, above) with the claimed login or
+  # a random lock. It only has to switch web_server's auth check on.
+  auth:
+    username: automyco-unclaimed
+    password: replaced-at-boot-by-camera-http
+
+camera_http:
+  id: camera_web
+  camera_id: chamber_camera
+  port: 8080
+  light: camera_flash          # lit only while /stream is watched or a /snapshot is taken...
+  light_enable: camera_light   # ...and only when the owner has Camera Light on
+  # frame_uploader (camera.yaml, common/camera-remote.yaml) also lights dark uploads through camera_http
+  # (hold_light, about 1.2-1.5 s, Light Timelapse Frames), so camera_http stays the LED's only driver.
+  claim_window: ${provisioning_window}
+
+chamber_link:
+  id: camera_link_to_chamber
+  version: ${camera_version}
+  camera_http_id: camera_web
+  camera_id: chamber_camera   # frame watchdog: no valid frame for 60 s -> the chamber power-cycles the camera
+
+# Updates from the app (Settings > Camera > Update camera: POST :8080/update, behind the camera login) or
+# the main board ({"ota":...} on the camera link). Only published releases, fetched by SHA-256 from
+# api.automyco.com and checked before booting; never older unless the app forces it.
+# docs/camera-install.md "Updating an AutoMyco camera". Each build pauses its own frame uploads
+# (on_begin/on_abort in camera.yaml and common/camera-remote.yaml).
+camera_update:
+  id: camera_updater
+  version: ${camera_version}
+  chamber_link_id: camera_link_to_chamber
+  camera_http_id: camera_web
+
+output:
+  - platform: ledc
+    id: flash_led_pwm
+    pin: GPIO4               # AI-Thinker flash LED; stock toggled it with {"flash": bool}
+    frequency: 5000Hz
+    # NOT channel 0 or 1: esp32_camera drives the OV2640's XCLK from LEDC channel 0 on timer 0, and a
+    # ledc output without `channel:` takes channel 0 (timer = channel / 2). Sharing it, lighting the
+    # LED stops XCLK (ledc_stop), so the sensor sends no frames until the camera restarts.
+    channel: 2
+
+light:
+  # The LED itself. Internal: camera_http drives it (see camera_http above), so it's never left on.
+  - platform: monochromatic
+    id: camera_flash
+    name: Camera Flash
+    internal: true
+    output: flash_led_pwm
+    restore_mode: ALWAYS_OFF
+    default_transition_length: 0s
+
+switch:
+  # The owner's preference. ON = light the camera's LED while someone watches live video or a snapshot
+  # is taken; it's off the rest of the time. Remembered across reboots.
+  - platform: template
+    id: camera_light
+    name: Camera Light
+    icon: mdi:flashlight
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+
+sensor:
+  - platform: wifi_signal
+    name: Camera WiFi Signal
+    update_interval: 60s
+
+button:
+  - platform: restart
+    name: Camera Restart

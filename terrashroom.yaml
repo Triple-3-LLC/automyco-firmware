@@ -1,0 +1,48 @@
+# Terrashroom TS-01: the personal build (your own Wi-Fi, API key and OTA password). The controller, the interlocks and every entity live in
+# common/terrashroom-core.yaml. This file adds only the network credentials, which come from the
+# gitignored secrets.yaml and are compiled into the image.
+#
+# Never publish an image built from this file. Strangers get terrashroom-public.yaml, which has no
+# credentials in it (see site/README.md).
+
+packages:
+  core: !include common/terrashroom-core.yaml
+  camera_link: !include common/camera-link.yaml   # camera link + camera firmware install (docs/camera-install.md)
+  scd41: !include common/scd41.yaml   # optional CO2 sensor; reads unavailable until one is fitted
+  cloud_identity: !include common/cloud-identity.yaml   # random per-chamber ID + token for automyco.com
+  fleet_health: !include
+    file: common/fleet-health.yaml   # opt-in health reports (Share Diagnostics, off by default)
+    vars:
+      fleet_build: owner
+  checkin: !include common/checkin.yaml   # opt-in anonymous daily check-in, off by default
+  push_alerts: !include common/push-alerts.yaml   # opt-in push alerts to the owner's iPhone (Push Alerts, off by default)
+  remote_access: !include common/remote-access.yaml   # see the chamber on automyco.com/remote (off, needs pairing)
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+  # ESPHome reboots after 15 min without a Home Assistant client by default. This chamber usually runs
+  # with only the iOS app / web UI (which don't use the native API), so that meant a reboot every 15 min.
+  reboot_timeout: 0s
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+    # While ESPHome writes the image, its main loop is blocked (up to a minute, longer on bad Wi-Fi),
+    # so neither the controller nor the heater's over-temperature cut-off runs. Leave nothing
+    # energised for that window. A failed upload resumes the controller; a good one reboots.
+    on_begin:
+      - script.stop: self_test   # it would switch loads back on if the upload failed
+      - switch.turn_off: heater
+      - switch.turn_off: atomizer
+      - switch.turn_off: uv_lamp
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "AutoMyco Setup"
+    password: !secret fallback_ap_password
+
+captive_portal:
+

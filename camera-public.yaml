@@ -1,0 +1,188 @@
+# AutoMyco camera: the public build of the TS-01 camera board, safe to hand to strangers (published on
+# automyco.com as board: camera, installed by the chamber over the stock camera's own updater).
+#
+#   esphome compile camera-public.yaml   # needs no secrets.yaml
+#
+# Same hardware and entities as the personal build (common/camera-core.yaml), minus the frame uploads
+# to your own S3 bucket. Instead, while the chamber has Remote Access on, it uploads frames to the
+# chamber's remote dashboard (common/camera-remote.yaml). The image holds no Wi-Fi credentials and no
+# key or password shared by every camera that runs it. Each camera gets its own:
+#   Wi-Fi    from the main board over the camera link ({"ssid","password"}, the stock protocol),
+#            whenever the camera boots or the install asks. No setup hotspot.
+#   Login    claimed once by the iOS app: POST :8080/claim inside the claim window after boot. Until
+#            then every endpoint is locked with a random login. One login covers the stream, the
+#            snapshot and the REST/SSE API. To claim again: the chamber's Camera Reset Login button
+#            (only within 30 min of the chamber's power-on) clears it and reboots the camera.
+#   API key  set by Home Assistant on adoption (api encryption with no key), inside a window that opens
+#            only when the chamber asks for it over the camera link (provisioning, below): after the
+#            chamber's own power-on, or its Open Adoption Window button (rear-button Pair window).
+#   OTA      plaintext OTA locked with a random per-boot password; encrypted OTA with the API key
+#            works once HA has set one, or the owner sets their own password (set_ota_password).
+#   Images   every update must carry the AutoMyco firmware signature (fw_signing, below), like the
+#            chamber's. Cameras on 1.1.0 or older don't check, so they take the first signed one.
+# The whole install flow: docs/camera-install.md.
+
+substitutions:
+  placeholder_ssid: automyco-camera-awaiting-chamber   # the Wi-Fi placeholder (wifi, below)
+  fw_public_key: ""   # empty = signing/fw_pub.pem, or the TEST key if that's missing (fw_signing below)
+
+packages:
+  core: !include common/camera-core.yaml
+  remote: !include common/camera-remote.yaml   # frames to the chamber's remote dashboard (docs/remote-access.md)
+
+esphome:
+  build_path: build/automyco-camera-public   # relative to .esphome/; publish_firmware.py reads it
+  includes:
+    - common/persist_now.h   # ts_persist_now(): the one-shot adoption flag reaches flash before the restart
+    - adopt_window.h         # when the HA adoption window may open (decide_camera)
+  on_boot:
+    # Before the OTA server starts: a placeholder lock (the radio is off, so the RNG isn't a real source
+    # yet), replaced at -100 once Wi-Fi has started.
+    - priority: 800
+      then:
+        - script.execute: lock_plaintext_ota
+    - priority: 800
+      then:
+        - lambda: id(camera_web)->set_placeholder_ssid("${placeholder_ssid}");   # no claim on that network
+    # The provisioning window (HA adoption) only on the boot the chamber asked for (on_command open_api,
+    # below), never after an ordinary boot. A Camera Power Cycle from the chamber's LAN API is a real
+    # power-on to the camera, so the reset reason can't stand in for physical presence here. After the API
+    # (setup priority 200) has loaded its key; a camera that has one is provisioned and isn't touched.
+    - priority: 100
+      then:
+        - lambda: |-
+            const auto d = ts_adopt::decide_camera(id(api_window_next_boot), api::global_api_server->get_noise_ctx().has_psk());
+            if (d.window_open) {
+              ts_persist_now(api_window_next_boot);   // cleared on flash: one boot only, even if this one is cut short
+              ESP_LOGI("security", "provisioning window open (asked by the chamber)");
+            } else if (d.close_now) {
+              provisioning::global_provisioning_manager->set_timeout(1);   // closes on the first loop
+            }
+    - priority: -100
+      then:
+        - lambda: |-
+            const size_t n = strnlen(id(owner_ota_password).data(), id(owner_ota_password).size());
+            if (n > 0) {
+              id(ota_main)->set_auth_password(std::string(id(owner_ota_password).data(), n));
+            } else {
+              id(lock_plaintext_ota).execute();
+            }
+
+script:
+  - id: lock_plaintext_ota   # random password nobody knows = plaintext OTA effectively off
+    then:
+      - lambda: |-
+          uint8_t rnd[16];
+          random_bytes(rnd, sizeof(rnd));
+          char pw[33];
+          for (size_t i = 0; i < sizeof(rnd); i++) snprintf(pw + 2 * i, 3, "%02x", rnd[i]);
+          id(ota_main)->set_auth_password(pw);
+
+globals:
+  - id: owner_ota_password    # set through the set_ota_password API action; empty = locked
+    type: std::array<char, 65>
+    restore_value: true
+    initial_value: 'std::array<char, 65>{}'
+  - id: api_window_next_boot  # the chamber asked for an adoption window: open it on the next boot, once
+    type: bool
+    restore_value: true
+    initial_value: "false"
+
+# {"cmd":"open_api"} from the chamber (only the chamber is on this wire): it sends it after its own
+# power-on or Open Adoption Window, both of which mean someone is at the chamber. A camera that already has
+# an API key ignores it. Otherwise it saves the request and restarts, and that boot keeps the window open.
+chamber_link:
+  on_command:
+    - lambda: |-
+        if (cmd != "open_api") return;
+        if (!ts_adopt::camera_should_restart_for_window(api::global_api_server->get_noise_ctx().has_psk())) {
+          ESP_LOGI("security", "chamber asked for an adoption window; this camera already has its API key");
+          return;
+        }
+        ESP_LOGW("security", "chamber asked for an adoption window: restarting with it open");
+        id(api_window_next_boot) = true;
+        ts_persist_now(api_window_next_boot);
+        App.safe_reboot();
+
+# Signed images (as the chamber's terrashroom-public.yaml "Signed firmware"; issue #32): every OTA path the
+# camera has (camera_update from the app or the chamber, ESPHome native OTA) ends in esp_ota_end(), which
+# rejects an image without a valid ECDSA P-256 signature from the AutoMyco firmware key. Verify-on-update
+# only: no secure boot, no flash encryption, no eFuse, the bootloader is untouched, so a serial reflash
+# always recovers a camera. Migration: 1.1.0 and older were built without this, so they install the first
+# signed release like any image (the 68-byte signature block after the image is never read by them), and
+# from then on only signed ones. publish_firmware.py --board camera signs; the manifest's SHA-256 (what the
+# app, the chamber and cloud/vendor-api fetch by) is of the signed bytes. The personal camera.yaml stays
+# unsigned.
+esp32:
+  framework:
+    sdkconfig_options:
+      CONFIG_SECURE_SIGNED_APPS_NO_SECURE_BOOT: "y"
+      CONFIG_SECURE_SIGNED_APPS_ECDSA_SCHEME: "y"          # Secure Boot V1 format: every ESP32 revision
+      CONFIG_SECURE_SIGNED_ON_UPDATE_NO_SECURE_BOOT: "y"
+      CONFIG_SECURE_SIGNED_ON_BOOT_NO_SECURE_BOOT: "n"     # not on boot: no new bootloader needed
+      CONFIG_SECURE_BOOT_BUILD_SIGNED_BINARIES: "n"        # the build never holds the private key
+      CONFIG_SECURE_BOOT: "n"                              # no hardware secure boot (eFuses)
+      CONFIG_SECURE_FLASH_ENC_ENABLED: "n"                 # no flash encryption (eFuses)
+
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [fw_signing]
+
+fw_signing:
+  public_key: ${fw_public_key}
+
+# Opened only on the boot the chamber asked for (on_boot priority 100 above), for ${provisioning_window}.
+provisioning:
+  timeout: ${provisioning_window}
+
+api:
+  encryption: {}   # no key: Home Assistant sets a per-camera key on adoption (saved in flash)
+  reboot_timeout: 0s   # the iOS app uses HTTP, not the native API
+  actions:
+    # Same as the public main-board build: only over an encrypted connection with the camera's own key.
+    - action: set_ota_password
+      variables:
+        password: string
+      then:
+        - lambda: |-
+            if (!api::global_api_server->get_noise_ctx().has_psk()) {
+              ESP_LOGW("security", "set_ota_password refused: the API has no encryption key yet");
+              return;
+            }
+            if (!password.empty() && (password.size() < 12 || password.size() > 64)) {
+              ESP_LOGW("security", "set_ota_password refused: use 12 to 64 characters, or \"\" to lock");
+              return;
+            }
+            id(owner_ota_password).fill(0);
+            password.copy(id(owner_ota_password).data(), password.size());
+            ts_persist_now(owner_ota_password);
+            if (password.empty()) {
+              id(lock_plaintext_ota).execute();
+            } else {
+              id(ota_main)->set_auth_password(password.str());
+            }
+
+ota:
+  - platform: esphome
+    id: ota_main
+    password: ""   # compiles in the password check; the real (random) password is set at boot
+
+safe_mode:
+  on_safe_mode:
+    - script.execute: lock_plaintext_ota
+
+wifi:
+  # No real network and no access point: Wi-Fi only ever comes from the chamber over the camera link
+  # (chamber_link), is saved in flash, and then takes priority over this placeholder (which ESPHome
+  # needs when there's no Improv: Improv would compete with chamber_link for the same UART).
+  # The placeholder is an open network anyone could broadcast, and a password in a public image would be
+  # public too, so it gets none. Instead, joining it gains nothing: no claim while it is the camera's
+  # network (camera_http set_placeholder_ssid, above), no HA adoption unless the chamber asked (above),
+  # OTA locked, every endpoint behind a random login; and the moment the chamber sends its network, the
+  # camera switches to it even if it's connected (chamber_link). Removing the placeholder would change
+  # how ESPHome brings Wi-Fi up on a camera that has never had a network (the first boot after an install)
+  # and where it keeps the saved one, on a board that's awkward to reach, so it stays. docs/camera-install.md.
+  networks:
+    - ssid: ${placeholder_ssid}

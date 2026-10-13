@@ -1,0 +1,271 @@
+# Cloud grow recipes: new species presets published as data on automyco.com, no reflash needed.
+#
+# Include it as a package, with cloud-identity.yaml (it uses ${cloud_base_url} and the shared cloud_http
+# HTTPS client declared there):
+#   packages:
+#     cloud_recipes: !include common/cloud-recipes.yaml
+#
+# What it does
+#   - Fetches ${cloud_base_url}/recipes/v1/index.json (static, public, no auth, TLS verified against the
+#     ESP-IDF certificate bundle) 2 min after boot and then every 24 h, or when "Refresh Cloud Recipes"
+#     is pressed. It sends nothing about the chamber except an ordinary GET (no device ID or token).
+#     The GET, TLS handshake and parse run in their own FreeRTOS task, so the climate controller never
+#     waits on the network; the main loop only swaps in the result.
+#   - Checks every value again on the chamber (common/cloud_recipes.h): clamps to the number entities'
+#     limits, rejects a recipe whose temperature is at or above max_safe_temp_f or that is malformed.
+#     Only a file with at least one good recipe replaces the cache.
+#   - Keeps the last good set in flash (written only when it changes), so recipes keep working offline
+#     and across reboots. With no cache and no network the "Cloud Recipe" select just offers "None".
+#   - "Cloud Recipe" select: "None" plus the cached recipes. Picking one sets Grow Preset to Custom and
+#     applies the recipe's stage for the current Grow Day (setpoints, idle airflow, and Light Hours /
+#     fresh air if the stage sets them). Multi-stage recipes advance by Grow Day. Changing the
+#     temperature or humidity setpoint by hand, or picking a built-in Grow Preset, turns it back to None,
+#     the same way a hand edit turns Grow Preset to Custom.
+#   - With common/recipe-co2.yaml (needs common/scd41.yaml), the recipe's pinning_co2_ppm / fruiting_co2_ppm
+#     also set CO2 Limit in Pinning and Fruiting. Without it those fields aren't read at all.
+#   - Built-in presets (Grow Preset) are untouched and work without any network.
+#   - Recipes never touch the UV-C lamp: there's no field for it and no code path to it.
+#
+# Schema and publishing: site/public/recipes/v1/schema.json, site/scripts/publish_recipes.py.
+
+esphome:
+  includes:
+    - common/cloud_recipes.h
+  on_boot:
+    - priority: -100   # after the restored globals are loaded; same pass as the core's setpoint restore
+      then:
+        - lambda: |-
+            ts_recipes::load();
+            id(cloud_recipe_quiet) = true;   // restoring: keep the restored setpoints, apply nothing
+            const char *sel = id(cloud_recipe_sel).data();
+            if (!ts_recipes::set_options(id(cloud_recipe), sel)) {
+              id(cloud_recipe_sel).fill(0);
+              id(cloud_recipe_stage) = -1;
+            }
+            id(cloud_recipe_quiet) = false;
+            id(cloud_recipe_publish_stage).execute();
+            char st[64];
+            if (ts_recipes::g_set.count > 0) snprintf(st, sizeof(st), "cached rev %u, %u recipes",
+                (unsigned) ts_recipes::g_set.revision, (unsigned) ts_recipes::g_set.count);
+            else snprintf(st, sizeof(st), "no recipes yet");
+            id(cloud_recipe_status).publish_state(st);
+            // Hand edits and built-in presets take over from a cloud recipe (as they do from a preset).
+            auto hand_edit = [](float) {
+              if (!id(booted) || id(applying_preset) || id(cloud_recipe_sel)[0] == '\0') return;
+              id(cloud_recipe_off).execute("setpoint changed by hand");
+            };
+            id(temperature_setpoint)->add_on_state_callback(hand_edit);
+            id(humidity_setpoint)->add_on_state_callback(hand_edit);
+            id(grow_preset)->add_on_state_callback([](size_t) {
+              if (!id(booted) || id(applying_preset) || id(cloud_recipe_sel)[0] == '\0') return;
+              id(cloud_recipe_off).execute("built-in preset chosen");
+            });
+            // Stage changes follow Grow Day (published every 60 s, and on Start/End Grow).
+            id(grow_day)->add_on_state_callback([](float) { id(cloud_recipe_apply).execute(false); });
+
+globals:
+  - id: cloud_recipe_sel      # name of the chosen cloud recipe ("" = none), kept across reboots
+    type: std::array<char, 25>
+    restore_value: true
+    initial_value: 'std::array<char, 25>{}'
+  - id: cloud_recipe_stage    # index of the stage last applied (-1 = none)
+    type: int
+    restore_value: true
+    initial_value: "-1"
+  - id: cloud_recipe_quiet    # true while the firmware itself sets the select (restore, refresh)
+    type: bool
+    initial_value: "false"
+
+interval:
+  - interval: 24h
+    startup_delay: 2min   # Wi-Fi and SNTP are normally up by then
+    then:
+      - script.execute: cloud_recipes_fetch
+
+script:
+  # Starts the background fetch (cloud_recipes.h fetch_async: own FreeRTOS task, shared cloud_http
+  # client from cloud-identity.yaml) and, back in the main loop, takes its result.
+  - id: cloud_recipes_fetch
+    mode: single
+    then:
+      - wait_until:
+          condition: wifi.connected
+          timeout: 10min
+      - if:
+          condition:
+            not: wifi.connected
+          then:
+            - lambda: id(cloud_recipe_status).publish_state("offline; using the cached recipes");
+            - script.stop: cloud_recipes_fetch
+      - lambda: |-
+          if (!ts_recipes::fetch_async(id(cloud_http), "${cloud_base_url}/recipes/v1/index.json", ${max_safe_temp_f}))
+            ESP_LOGW("recipes", "fetch not started (one running, or low heap)");
+      - wait_until:
+          condition:
+            lambda: return ts_recipes::g_fetch_state != 1;
+          timeout: 2min
+      - lambda: |-
+          std::unique_ptr<ts_recipes::FetchResult> res(ts_recipes::take_result());
+          if (!res) return;   // never started, or still running after 2 min (taken next time)
+          auto now = id(sntp_time).now();
+          char when[16] = "";
+          if (now.is_valid()) snprintf(when, sizeof(when), " %02d-%02d %02d:%02d", now.month, now.day_of_month, now.hour, now.minute);
+          char st[96];
+          if (res->status != 200) {
+            if (res->status < 0) snprintf(st, sizeof(st), "fetch failed%s; using cached rev %u", when, (unsigned) ts_recipes::g_set.revision);
+            else snprintf(st, sizeof(st), "HTTP %d%s; using cached rev %u", res->status, when, (unsigned) ts_recipes::g_set.revision);
+            id(cloud_recipe_status).publish_state(st);
+            return;
+          }
+          if (!res->ok) {
+            ESP_LOGW("recipes", "rejected index.json: %s", res->report.c_str());
+            id(cloud_recipe_status).publish_state(("rejected" + std::string(when) + ": " + res->report).substr(0, 200));
+            id(log_event).execute("cloud recipes rejected");
+            return;
+          }
+          if (!res->report.empty()) ESP_LOGW("recipes", "%s", res->report.c_str());
+          const ts_recipes::Set &fresh = res->set;
+          snprintf(st, sizeof(st), "rev %u, %u recipes%s%s", (unsigned) fresh.revision, (unsigned) fresh.count, when,
+                   res->report.empty() ? "" : " (some skipped/clamped)");
+          id(cloud_recipe_status).publish_state(st);
+          if (memcmp(&fresh, &ts_recipes::g_set, sizeof(ts_recipes::Set)) == 0) return;   // unchanged: no flash write
+          // If the chosen recipe's stages changed, the stage in force is re-applied below.
+          const char *sel = id(cloud_recipe_sel).data();
+          const auto *old_r = ts_recipes::find(ts_recipes::g_set, sel);
+          const auto *new_r = ts_recipes::find(fresh, sel);
+          const bool same = old_r != nullptr && new_r != nullptr && old_r->n_stages == new_r->n_stages &&
+                            memcmp(old_r->stages, new_r->stages, sizeof(old_r->stages)) == 0;
+          ts_recipes::g_set = fresh;
+          ts_recipes::save();
+          id(log_event).execute("cloud recipes updated to rev " + std::to_string(fresh.revision));
+          id(cloud_recipe_quiet) = true;
+          const bool still_there = ts_recipes::set_options(id(cloud_recipe), sel);
+          id(cloud_recipe_quiet) = false;
+          if (!still_there) {
+            id(cloud_recipe_off).execute("recipe withdrawn; setpoints kept");
+          } else if (sel[0] != '\0' && !same) {
+            id(cloud_recipe_apply).execute(true);
+          }
+
+  # Applies the chosen recipe's stage for the current Grow Day. force=false only acts when the stage
+  # changes (the Grow Day callback); force=true re-applies it (newly chosen, or its values changed).
+  # With no grow running, the recipe stays on its current stage (the first one when newly chosen).
+  - id: cloud_recipe_apply
+    mode: queued
+    parameters:
+      force: bool
+    then:
+      - lambda: |-
+          const char *sel = id(cloud_recipe_sel).data();
+          if (sel[0] == '\0') return;
+          const ts_recipes::Recipe *r = ts_recipes::find(ts_recipes::g_set, sel);
+          if (r == nullptr) return;
+          const float day = id(grow_day).state;
+          int idx;
+          if (!std::isnan(day)) idx = ts_recipes::stage_for_day(*r, (int) day);
+          else idx = (id(cloud_recipe_stage) >= 0 && id(cloud_recipe_stage) < r->n_stages) ? id(cloud_recipe_stage) : 0;
+          if (!force && idx == id(cloud_recipe_stage)) return;
+          const ts_recipes::Stage &s = r->stages[idx];
+          id(applying_preset) = true;   // the setpoints' own on_value leaves Grow Preset alone
+          if (std::string(id(grow_preset).current_option()) != "Custom") id(grow_preset).make_call().set_option("Custom").perform();
+          id(temperature_setpoint).make_call().set_value(s.temp_f).perform();
+          id(humidity_setpoint).make_call().set_value(s.rh).perform();
+          id(idle_airflow) = s.airflow;   // after Grow Preset: Custom, which resets it to the stock 7
+          // Pinning RH: the built-in species of the same name, if any (0: the old setpoint + 3 rule).
+          id(species_pinning_rh) = grow_climate::species_pinning_rh(r->name);
+          if (s.light_h >= 0) id(light_hours).make_call().set_value(s.light_h).perform();
+          if (s.fae_int_5 > 0) id(fresh_air_interval).make_call().set_value(s.fae_int_5 * ts_recipes::FAE_INT_STEP).perform();
+          if (s.fae_dur_10 > 0) id(fresh_air_duration).make_call().set_value(s.fae_dur_10 * ts_recipes::FAE_DUR_STEP).perform();
+          id(applying_preset) = false;
+          id(cloud_recipe_stage) = idx;
+          ts_recipes::after_apply(*r);   // CO2 Limit for the phase, with common/recipe-co2.yaml; otherwise nothing
+          char msg[80];
+          snprintf(msg, sizeof(msg), "recipe %s: stage %d/%d (%u F, %u %%)", r->name, idx + 1, r->n_stages,
+                   (unsigned) s.temp_f, (unsigned) s.rh);
+          id(log_event).execute(msg);
+      - script.execute: cloud_recipe_publish_stage
+
+  # Turns the cloud recipe off (select back to None); the current setpoints stay as they are.
+  - id: cloud_recipe_off
+    parameters:
+      why: std::string
+    then:
+      - lambda: |-
+          id(cloud_recipe_sel).fill(0);
+          id(cloud_recipe_stage) = -1;
+          id(cloud_recipe_quiet) = true;
+          if (id(cloud_recipe).active_index().value_or(0) != 0) id(cloud_recipe).publish_state((size_t) 0);
+          id(cloud_recipe_quiet) = false;
+          id(log_event).execute("cloud recipe off: " + why);
+      - script.execute: cloud_recipe_publish_stage
+
+  - id: cloud_recipe_publish_stage
+    then:
+      - lambda: |-
+          const ts_recipes::Recipe *r = ts_recipes::find(ts_recipes::g_set, id(cloud_recipe_sel).data());
+          const int i = id(cloud_recipe_stage);
+          std::string s = "none";
+          if (r != nullptr && i >= 0 && i < r->n_stages) {
+            char b[48];
+            snprintf(b, sizeof(b), "%d/%d (from day %u)", i + 1, r->n_stages, (unsigned) r->stages[i].from_day);
+            s = b;
+          }
+          if (id(cloud_recipe_stage_sensor).state != s) id(cloud_recipe_stage_sensor).publish_state(s);
+
+select:
+  - platform: template
+    id: cloud_recipe
+    name: Cloud Recipe
+    icon: mdi:cloud-download-outline
+    optimistic: true
+    # No restore_value: the options only exist at runtime. The choice is kept by name in
+    # cloud_recipe_sel and shown again at boot once the cached recipes are loaded.
+    options:
+      - None
+    initial_option: None
+    web_server:
+      sorting_group_id: grp_grow
+      sorting_weight: 2
+    on_value:
+      - lambda: |-
+          if (id(cloud_recipe_quiet) || !id(booted)) return;
+          if (x == "None") {
+            if (id(cloud_recipe_sel)[0] != '\0') id(cloud_recipe_off).execute("turned off");
+            return;
+          }
+          const auto *r = ts_recipes::find(ts_recipes::g_set, std::string(x).c_str());
+          if (r == nullptr) return;
+          id(cloud_recipe_sel).fill(0);
+          strncpy(id(cloud_recipe_sel).data(), r->name, ts_recipes::NAME_LEN);
+          id(cloud_recipe_stage) = -1;
+          id(cloud_recipe_apply).execute(true);
+
+text_sensor:
+  - platform: template
+    id: cloud_recipe_stage_sensor
+    name: Cloud Recipe Stage
+    icon: mdi:stairs
+    update_interval: never
+    web_server:
+      sorting_group_id: grp_grow
+      sorting_weight: 4
+  - platform: template
+    id: cloud_recipe_status
+    name: Cloud Recipes Status
+    icon: mdi:cloud-check-outline
+    entity_category: diagnostic
+    update_interval: never
+    web_server:
+      sorting_group_id: grp_health
+      sorting_weight: 10
+
+button:
+  - platform: template
+    name: Refresh Cloud Recipes
+    icon: mdi:cloud-refresh-outline
+    entity_category: diagnostic
+    web_server:
+      sorting_group_id: grp_health
+      sorting_weight: 11
+    on_press:
+      - script.execute: cloud_recipes_fetch

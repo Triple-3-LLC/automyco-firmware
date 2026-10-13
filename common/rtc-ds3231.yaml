@@ -1,0 +1,87 @@
+# Optional add-on: DS3231 real-time clock, so the chamber has the time after a power-on with no internet
+# (issue #29, docs/time-and-schedule.md). Opt-in: no build includes it by default, and the public build
+# must not (it costs flash in an image that has to fit the stock app slot, and most chambers have no RTC).
+#
+# Include it as an extra package in a personal build:
+#   packages:
+#     core: !include common/terrashroom-core.yaml
+#     rtc: !include common/rtc-ds3231.yaml
+#
+# Wiring: a DS3231 breakout (with its coin cell) on the shared I2C bus, like the SCD41: 3V3, GND, SDA on
+# GPIO21, SCL on GPIO22, address 0x68, which clashes with nothing on the board (HDC1080 0x40, INA219 0x45,
+# SCD41 0x62). Power it from 3V3, never 5 V: most breakouts pull SDA/SCL up to their own supply. The
+# AT24C32 EEPROM on the common ZS-042 board sits at 0x57 and is unused. A DS1307 is not a drop-in: it has
+# no oscillator-stop flag, and register 0x0F is RAM on it.
+#
+# What it does:
+#   - At boot (before the resume-after-power-cut check runs), reads the RTC and sets the system clock from
+#     it, unless the RTC's oscillator-stop flag is set (flat or missing coin cell), the time is older than
+#     this firmware, or it is earlier than the last time the chamber knew it was alive. A rejected RTC is
+#     logged and ignored; the chamber then waits for SNTP as it does without one.
+#   - After each SNTP sync (every 15 min), writes the synced time back to the RTC and clears its
+#     oscillator-stop flag. The RTC never overrides SNTP while the chamber is running.
+# Time Source reads "rtc" until the first SNTP sync. With the clock from the RTC, the light schedule, Grow
+# Day, the phase timer and the power-cut judgement (Last Power Outage, the 72 h Grow Paused rule) all work
+# offline from boot. Nothing safety-related depends on it: those interlocks run on millis().
+#
+# No RTC fitted: the boot read fails with one warning in the log and everything else runs as usual.
+
+esphome:
+  includes:
+    - common/rtc_ds3231.h
+  on_boot:
+    # After the I2C bus (1000) and the restored globals (800), so last_alive holds the saved value. Before
+    # the core's -100 entry clears it, and before the resume check's first 10 s tick.
+    - priority: 590
+      then:
+        - lambda: |-
+            using namespace rtc_ds3231;
+            auto *bus = id(i2c_bus);
+            uint8_t reg = REG_STATUS, st = 0, r[7];
+            if (bus->write_readv(ADDR, &reg, 1, &st, 1) != i2c::ERROR_OK) {
+              ESP_LOGW("rtc", "no DS3231 at 0x68: waiting for SNTP");
+              return;
+            }
+            reg = REG_TIME;
+            if (bus->write_readv(ADDR, &reg, 1, r, 7) != i2c::ERROR_OK) {
+              ESP_LOGW("rtc", "DS3231 read failed: waiting for SNTP");
+              return;
+            }
+            const uint32_t t = decode(r);
+            if (!plausible(t, st & OSF, id(last_alive))) {
+              ESP_LOGW("rtc", "DS3231 time not trusted (%s, epoch %u, last alive %u): waiting for SNTP",
+                       (st & OSF) ? "oscillator stopped" : "out of range", (unsigned) t, (unsigned) id(last_alive));
+              return;
+            }
+            struct timeval tv = {.tv_sec = (time_t) t, .tv_usec = 0};
+            if (settimeofday(&tv, nullptr) != 0) {
+              ESP_LOGW("rtc", "settimeofday failed");
+              return;
+            }
+            id(time_from_rtc) = true;
+            ESP_LOGI("rtc", "clock set from DS3231: epoch %u", (unsigned) t);
+
+interval:
+  # Write SNTP time back to the RTC after each sync (time_synced_at changes at every sync).
+  - interval: 60s
+    then:
+      - lambda: |-
+          using namespace rtc_ds3231;
+          static uint32_t written = time_source::NEVER;
+          const uint32_t s = id(time_synced_at);
+          if (s <= time_source::LONG_AGO || s == written) return;
+          auto *bus = id(i2c_bus);
+          uint8_t buf[8];
+          buf[0] = REG_TIME;
+          encode((uint32_t) ::time(nullptr), buf + 1);
+          if (bus->write(ADDR, buf, 8) != i2c::ERROR_OK) {
+            ESP_LOGW("rtc", "DS3231 write failed");
+            return;   // retried next minute
+          }
+          uint8_t reg = REG_STATUS, st = 0;
+          if (bus->write_readv(ADDR, &reg, 1, &st, 1) == i2c::ERROR_OK && (st & OSF)) {
+            const uint8_t clr[2] = {REG_STATUS, (uint8_t) (st & ~OSF)};
+            bus->write(ADDR, clr, 2);
+          }
+          written = s;
+          ESP_LOGD("rtc", "DS3231 set from SNTP");

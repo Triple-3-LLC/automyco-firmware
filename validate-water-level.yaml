@@ -1,0 +1,11 @@
+# Validation build, not for flashing: the personal build plus the opt-in non-contact water-level sensor
+# package (common/water-level-sensor.yaml, issue #27). CI runs `esphome config` and the safety checks on
+# every validate-*.yaml so opt-in packages that no shipped build includes still get checked. To use the
+# package for real, add its line to your own build's packages instead.
+
+packages:
+  build: !include terrashroom.yaml
+  water_level: !include common/water-level-sensor.yaml
+
+esphome:
+  build_path: build/validate-water-level   # relative to .esphome/; keeps the personal build's dir clean

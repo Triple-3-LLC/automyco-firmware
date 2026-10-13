@@ -1,0 +1,299 @@
+# Firmware updates from automyco.com, fetched by the chamber itself (public build only).
+#
+# Every 6 hours the chamber asks ${cloud_base_url}/api/fw/manifest which release is meant for it. The
+# server answers per chamber, which is how a release rolls out in stages: a new version goes to a
+# fraction of chambers first (10 %, then more), picked by a hash of the Cloud Device ID
+# (site/lambda/fleet.mjs, docs/fleet-updates.md). Chambers outside the fraction keep being offered the
+# previous release, and the server never offers anything older than what a chamber runs.
+#
+# Installing:
+#   - "Install Firmware Update" installs the offered version. While a grow is running (Start Grow
+#     pressed, End Grow not yet), the first press only asks: press it again within 60 s to install
+#     anyway. The update reboots the chamber; Climate Control and the grow carry on afterwards, but the
+#     fans, mist and heater stop for the minute or two it takes.
+#   - "Auto-Install Updates" (off by default) installs on its own, but only between 02:00 and 05:00
+#     local time and never while a grow is running.
+#   - "Check for Updates" (on by default) can turn the checks off entirely. Then the chamber never
+#     contacts automyco.com for updates.
+# The download is checked against the manifest's MD5 before the chamber switches to it, and it goes
+# into the inactive app slot, so a failed or cut-off download leaves the running firmware alone. ESP-IDF
+# then checks the AutoMyco signature (terrashroom-public.yaml "Signed firmware").
+#
+# Never backwards: only a version strictly newer than the running one is installed (common/fw_version.h).
+# ESPHome's update entity calls any different version "available", so a wrong or hostile manifest could
+# otherwise offer an older, validly signed image with a fixed bug back in it. The auto-install never takes
+# one and no push goes out for it. Rollback stays possible on purpose: "Install Firmware Update" pressed
+# within 2 minutes of holding the rear button 2-4 s installs whatever the server offers, older included
+# (still signature-checked). The fleet way back from a bad release is a new, higher version built from the
+# old code (docs/fleet-updates.md "Downgrades and rolling back"). Native OTA (esphome upload, the iOS app) can't be
+# checked this way: ESPHome writes those images without asking, so a downgrade there needs the owner's OTA
+# password or API key and a signed image (same section).
+#
+# The ESPHome update entity itself is internal: Home Assistant and the web UI would otherwise install
+# straight from it and skip the grow check. Native OTA (esphome run, the iOS app) still works as before.
+#
+# Push: when a new version is first seen and Push Alerts is on, the chamber sends one `firmware_update`
+# alert (POST ${cloud_base_url}/api/device/alert, same route and task as common/push-alerts.yaml; the
+# server pushes it to phones that subscribed to "Firmware updates"). Once per version, kept across reboots;
+# a failed send is retried after 10 min, three times.
+#
+# Needs common/cloud-identity.yaml. Only terrashroom-public.yaml includes this: the personal build has its
+# own Wi-Fi and keys compiled in, and installing the public release over it would drop them.
+
+esphome:
+  includes:
+    - common/fw_version.h   # "is the offered version newer than mine?" (tests/test_fw_version.cpp)
+  on_boot:
+    - priority: -110   # after cloud-identity.yaml has made the device ID (-100)
+      then:
+        - lambda: |-
+            id(fw_update)->set_source_url(std::string("${cloud_base_url}/api/fw/manifest?d=") +
+                                          id(cloud_device_id).data() + "&v=" + ESPHOME_PROJECT_VERSION);
+
+globals:
+  - id: fw_confirm_until   # millis() until which a second Install press overrides the grow check (0 = none)
+    type: uint32_t
+    initial_value: "0"
+  - id: fw_push_version    # the version the "firmware update available" push was last sent for (saved)
+    type: std::array<char, 25>
+    restore_value: true
+    initial_value: 'std::array<char, 25>{}'
+  - id: fw_push_pending    # a push for fw_update's latest_version is waiting to go
+    type: bool
+    initial_value: "false"
+  - id: fw_push_at         # millis() before which the pending push isn't tried
+    type: uint32_t
+    initial_value: "0"
+  - id: fw_push_fails
+    type: uint8_t
+    initial_value: "0"
+
+ota:
+  - platform: http_request
+    id: ota_cloud
+    # Same as the native OTA: the main loop is blocked while the image is written, so nothing stays on.
+    on_begin:
+      - switch.turn_off: heater
+      - switch.turn_off: atomizer
+      - switch.turn_off: uv_lamp
+    on_error:
+      - script.execute: { id: log_event, msg: "firmware update failed; still on the old version" }
+
+update:
+  - platform: http_request
+    id: fw_update
+    name: Firmware Update
+    internal: true                 # installs go through the buttons below (grow check)
+    source: ${cloud_base_url}/api/fw/manifest   # replaced at boot with this chamber's URL (above)
+    update_interval: never         # polled by the interval below, only while Check for Updates is on
+    on_update_available:
+      - lambda: |-
+          const std::string &v = id(fw_update)->update_info.latest_version;
+          if (!fw_version::is_newer(v.c_str(), ESPHOME_PROJECT_VERSION)) {
+            id(log_event).execute("firmware " + v + " offered, not newer: ignored");
+            return;
+          }
+          id(log_event).execute("firmware " + v + " available");
+          // One push per version (rising edge), whatever the check interval does.
+          if (!v.empty() && strncmp(v.c_str(), id(fw_push_version).data(), 24) != 0 && !id(fw_push_pending)) {
+            id(fw_push_pending) = true;
+            id(fw_push_fails) = 0;
+            id(fw_push_at) = millis();
+          }
+
+switch:
+  - platform: template
+    id: fw_check_enabled
+    name: Check for Updates
+    icon: mdi:cloud-download-outline
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    web_server:
+      sorting_group_id: grp_health
+      sorting_weight: 14
+  - platform: template
+    id: fw_auto_install
+    name: Auto-Install Updates
+    icon: mdi:update
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    web_server:
+      sorting_group_id: grp_health
+      sorting_weight: 15
+
+text_sensor:
+  - platform: template
+    id: fw_update_status
+    name: Firmware Update Status
+    icon: mdi:cellphone-arrow-down
+    entity_category: diagnostic
+    update_interval: never
+    web_server:
+      sorting_group_id: grp_health
+      sorting_weight: 16
+
+script:
+  # One update check, started only when no other cloud request is running and there is heap for the TLS
+  # handshake (cloud_post.h tls_ready()). 1.2.0 started it regardless, so it could run next to another
+  # handshake on a heap that was already short (Lowest Free Heap 120 B on the bench). Waits up to 10 min
+  # for room, otherwise skips this round: the next 6-hourly check, or a button press, tries again.
+  - id: fw_check
+    mode: single
+    then:
+      - wait_until:
+          condition:
+            lambda: return ts_cloud::tls_ready();
+          timeout: 10min
+      - if:
+          condition:
+            lambda: return ts_cloud::tls_ready();
+          then:
+            - component.update: fw_update
+          else:
+            - logger.log: { level: WARN, tag: update, format: "update check skipped: another cloud request, or not enough heap for TLS" }
+
+button:
+  - platform: template
+    name: Check for Firmware Update
+    icon: mdi:refresh
+    entity_category: diagnostic
+    on_press:
+      - if:
+          condition:
+            switch.is_on: fw_check_enabled
+          then:
+            - script.execute: fw_check
+    web_server:
+      sorting_group_id: grp_health
+      sorting_weight: 17
+  - platform: template
+    name: Install Firmware Update
+    icon: mdi:download
+    on_press:
+      - lambda: |-
+          auto *u = id(fw_update);
+          if (u->state != update::UPDATE_STATE_AVAILABLE) {
+            ESP_LOGI("update", "no update to install");
+            return;
+          }
+          const std::string to = u->update_info.latest_version;
+          // Older or equal: only as a deliberate owner rollback, pressed inside the rear-button Pair window
+          // (common/owner_gate.h; the owner's build has no gate). The image must still be AutoMyco-signed.
+          if (!fw_version::is_newer(to.c_str(), ESPHOME_PROJECT_VERSION)) {
+            if (!owner_gate::present()) {
+              id(fw_update_status).publish_state("refused: " + to + " isn't newer than " ESPHOME_PROJECT_VERSION +
+                                                 std::string(" (to roll back: hold the rear button 2-4 s, then Install)"));
+              id(log_event).execute("update to " + to + " refused: not newer");
+              return;
+            }
+            id(log_event).execute("rolling back to " + to + " (owner, Pair window)");
+          }
+          if (id(grow_start) != 0) {
+            if (id(fw_confirm_until) == 0 || (int32_t) (millis() - id(fw_confirm_until)) > 0) {
+              id(fw_confirm_until) = millis() + 60000;
+              id(fw_update_status).publish_state("grow running: press Install again within 60 s to update to " + to);
+              id(log_event).execute("update to " + to + " held: grow running");
+              return;
+            }
+            id(log_event).execute("installing " + to + " during the grow (confirmed)");
+          } else {
+            id(log_event).execute("installing " + to);
+          }
+          id(fw_confirm_until) = 0;
+          u->perform(false);
+    web_server:
+      sorting_group_id: grp_health
+      sorting_weight: 18
+
+interval:
+  # Update check: 2 min after boot, then every 6 h.
+  - interval: 6h
+    startup_delay: 120s
+    then:
+      - if:
+          condition:
+            switch.is_on: fw_check_enabled
+          then:
+            - script.execute: fw_check
+  # Status text, and the night-time auto-install.
+  - interval: 5s
+    then:
+      - lambda: |-
+          auto *u = id(fw_update);
+          std::string s;
+          switch (u->state) {
+            case update::UPDATE_STATE_INSTALLING: {
+              char b[40];
+              snprintf(b, sizeof(b), "installing %.0f%%", u->update_info.has_progress ? u->update_info.progress : 0.0f);
+              s = b;
+              break;
+            }
+            case update::UPDATE_STATE_AVAILABLE:
+              s = fw_version::is_newer(u->update_info.latest_version.c_str(), ESPHOME_PROJECT_VERSION)
+                      ? u->update_info.latest_version + " available" : "up to date";
+              break;
+            case update::UPDATE_STATE_NO_UPDATE: s = "up to date"; break;
+            default: s = id(fw_check_enabled).state ? "not checked yet" : "checks off"; break;
+          }
+          if (u->status_has_error()) s += " (last check failed)";
+          if (id(fw_confirm_until) != 0 && (int32_t) (millis() - id(fw_confirm_until)) < 0) return;   // keep the prompt up
+          if (id(fw_update_status).state != s) id(fw_update_status).publish_state(s);
+  # The "firmware update available" push (see the header). Only while Push Alerts is on.
+  - interval: 30s
+    then:
+      - lambda: |-
+          const int st = ts_identity::g_fw_push_status;
+          if (st == 1) return;   // in flight
+          if (st != 0) {         // a send finished: take its result once
+            ts_identity::g_fw_push_status = 0;
+            if ((st >= 200 && st < 300) || (st >= 400 && st < 500)) {
+              // Delivered, or refused (retrying won't help): either way this version is done.
+              id(fw_push_version).fill(0);
+              strncpy(id(fw_push_version).data(), id(fw_update)->update_info.latest_version.c_str(), 24);
+              id(fw_push_pending) = false;
+              ts_persist_now(fw_push_version);
+              if (st < 300) ESP_LOGI("update", "update push sent");
+              else ESP_LOGW("update", "update push refused: HTTP %d", st);
+            } else if (++id(fw_push_fails) >= 3) {
+              id(fw_push_pending) = false;   // give up on this version; a later one gets a fresh try
+              ESP_LOGW("update", "update push failed (HTTP %d); giving up", st);
+            } else {
+              id(fw_push_at) = millis() + 600000UL;
+              ESP_LOGW("update", "update push failed (HTTP %d); retrying in 10 min", st);
+            }
+            return;
+          }
+          if (!id(fw_push_pending) || !id(push_alerts).state) return;
+          auto *u = id(fw_update);
+          if (u->state != update::UPDATE_STATE_AVAILABLE ||
+              !fw_version::is_newer(u->update_info.latest_version.c_str(), ESPHOME_PROJECT_VERSION)) {
+            id(fw_push_pending) = false;   // installed, withdrawn, or not newer
+            return;
+          }
+          if ((int32_t) (millis() - id(fw_push_at)) < 0) return;
+          if (!network::is_connected() || strnlen(id(cloud_device_id).data(), 33) != 32) return;
+          char msg[160];
+          snprintf(msg, sizeof(msg), "AutoMyco %.24s is ready. Open the app to install it%s.", u->update_info.latest_version.c_str(),
+                   id(fw_auto_install).state ? ", or it installs itself tonight (Auto-Install is on)" : "");
+          const std::string body = json::build_json([&](JsonObject root) {
+            root["kind"] = "firmware_update";
+            root["message"] = msg;
+          });
+          if (!ts_cloud::post_async(id(cloud_http), "${cloud_base_url}/api/device/alert", body,
+                                    id(cloud_device_id).data(), id(cloud_device_token).data(),
+                                    ts_identity::g_fw_push_status, "ts01_fwpush")) {
+            id(fw_push_at) = millis() + 30000UL;   // another cloud request is running, or low heap
+          }
+  - interval: 10min
+    then:
+      - lambda: |-
+          auto *u = id(fw_update);
+          if (!id(fw_auto_install).state || u->state != update::UPDATE_STATE_AVAILABLE) return;
+          if (!fw_version::is_newer(u->update_info.latest_version.c_str(), ESPHOME_PROJECT_VERSION)) return;   // never backwards
+          if (id(grow_start) != 0) return;   // never during a grow
+          auto now = id(sntp_time).now();
+          if (!now.is_valid() || now.hour < 2 || now.hour >= 5) return;
+          id(log_event).execute("auto-installing " + u->update_info.latest_version);
+          u->perform(false);

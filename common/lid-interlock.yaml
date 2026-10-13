@@ -1,0 +1,84 @@
+# Optional add-on: lid reed switch as a UV-C interlock (issue #28, docs/lid-interlock.md; logic in
+# common/lid_interlock.h, host tests in tests/test_lid_interlock.cpp). Opt-in: no build includes it by
+# default, and the public build must not (stock chambers have no lid switch; with this package and no
+# switch fitted, UV-C could never turn on).
+#
+# Include it as an extra package in a personal build:
+#   packages:
+#     core: !include common/terrashroom-core.yaml
+#     lid: !include common/lid-interlock.yaml
+#
+# Wiring: a normally-open reed contact (closed when the magnet is near, e.g. an MC-38 door contact) between
+# GPIO27 (module pad 12) and GND, through 1 kOhm. The internal pull-up holds the pin HIGH otherwise.
+# Lid shut = contact closed = LOW = Lid Closed ON. The printed cradle and magnet holder are in
+# hardware/ts01-retrofit/ (docs/retrofit-guide.md).
+#
+# Fail-safe: HIGH means open, and so do a lifted lid, a broken or unplugged lead, a missing switch and a
+# lost magnet. UV-C Lamp is refused unless the lid has read shut for 500 ms without a break, and a lit lamp
+# is cut on the first open reading, by two independent paths:
+#   1. the reed GPIO's own binary sensor (interrupt-driven, no filter): its on_press cuts at once;
+#   2. a 50 ms watchdog that reads the pin directly and cuts if the lamp is on and the lid isn't proven shut.
+# The core's UV-C Lamp turn-on also checks uv_lid_ok, which this package holds false while the lid is open.
+# UV-C still boots OFF and never turns on by itself: this only ever turns it off or refuses it.
+# tools/check_firmware_safety.py checks that a build with a lid sensor keeps all of this wired up.
+#
+# The recommended belt-and-braces is a hardware interlock as well: a second reed contact in series with the
+# UV-C drive, so an open lid cuts the lamp even if the firmware hangs (docs/lid-interlock.md).
+
+substitutions:
+  lid_gpio: "27"   # GPIO27: plain I/O, not a strapping pin, internal pull-up (docs/hardware.md)
+
+esphome:
+  includes:
+    - common/lid_interlock.h
+  on_boot:
+    # Blocked from the start; the watchdog lifts it once the lid has read shut for 500 ms. (UV-C is
+    # ALWAYS_OFF at boot anyway, and nothing can ask for it before the API and web server are up.)
+    - priority: 600
+      then:
+        - lambda: id(uv_lid_ok) = false;
+
+binary_sensor:
+  # Path 1: the raw reed input. ON = pin HIGH = open (or no switch). No filters: an open lid must act at once.
+  - platform: gpio
+    id: lid_reed_open
+    internal: true
+    pin:
+      number: GPIO${lid_gpio}
+      mode:
+        input: true
+        pullup: true
+    on_press:
+      - lambda: |-
+          id(uv_lid_ok) = false;
+          if (id(uv_c).state || id(uv_lamp).state) {
+            id(uv_c).turn_off();   // the pin first
+            id(log_event).execute("UV-C cut: lid opened");
+            id(uv_lamp).turn_off();
+          }
+
+  # What apps and Home Assistant see: debounced (shut only after 500 ms), published by the watchdog.
+  - platform: template
+    id: lid_closed
+    name: Lid Closed
+    icon: mdi:door-closed-lock
+    web_server:
+      sorting_group_id: grp_uvc
+      sorting_weight: 3
+
+interval:
+  # Path 2: the watchdog. Reads the pin itself (not the binary sensor above), keeps uv_lid_ok and Lid Closed
+  # up to date, and cuts a lamp that is on while the lid isn't proven shut.
+  - interval: 50ms
+    then:
+      - lambda: |-
+          namespace li = lid_interlock;
+          static li::Debounce deb;
+          const bool closed = li::update(deb, li::raw_closed(digitalRead(${lid_gpio}) == HIGH), millis());
+          id(uv_lid_ok) = closed;
+          if (li::must_cut(id(uv_c).state || id(uv_lamp).state, closed)) {
+            id(uv_c).turn_off();
+            id(log_event).execute("UV-C cut: lid opened");
+            id(uv_lamp).turn_off();
+          }
+          if (!id(lid_closed).has_state() || id(lid_closed).state != closed) id(lid_closed).publish_state(closed);

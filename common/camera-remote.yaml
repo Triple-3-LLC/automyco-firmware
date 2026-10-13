@@ -1,0 +1,103 @@
+# Remote frames for the AutoMyco camera: while its chamber has Remote Access on and is paired, the camera
+# uploads a frame every ${remote_frame_interval} to beezy.ninja in the chamber's name, and the frame shows
+# on the chamber's remote dashboard. Nothing to set up: the chamber hands the camera its credentials over
+# the camera wire whenever the camera boots (common/remote-access.yaml on the main board,
+# chamber_link {"cmd":"remote"}), and tells it to stop when Remote Access goes off or the chamber is
+# unpaired. The camera keeps them in RAM only.
+#
+# The camera gets a key derived for frames only, never the chamber's token: it can post frames and
+# nothing else. The server checks the key against a hash the chamber reports, refuses frames while the
+# cloud is switched off or the account isn't enabled, takes at most one a minute, and deletes them after
+# 30 days. Design: docs/remote-access.md "Camera".
+#
+# Included by camera-public.yaml. The owner's camera.yaml keeps its own frame-ingest uploads instead.
+
+substitutions:
+  remote_frame_interval: 300s   # one frame every 5 min (the server takes at most one a minute)
+
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [frame_uploader]
+
+frame_uploader:
+  id: remote_frames
+  camera_id: chamber_camera
+  remote_interval: ${remote_frame_interval}   # no url/token/grow: remote mode only
+  update_interval: 15s                        # checks whether one is due: every 30 s while someone's watching
+  camera_http_id: camera_web   # lights dark frames with the camera LED (Light Timelapse Frames)
+
+# The download needs the camera's only TLS session: no uploads while it runs.
+camera_update:
+  on_begin:
+    - lambda: id(remote_frames).set_paused(true);
+  on_abort:
+    - lambda: id(remote_frames).set_paused(false);
+
+chamber_link:
+  on_remote:
+    - lambda: |-
+        id(remote_frames).set_remote(url, device_id, key);
+
+switch:
+  # Light dark frames with the camera's LED (about 1.2-1.5 s, faded up, then back to what it was).
+  # Default ON. Daytime frames stay natural: only scenes the sensor reports as dark get lit.
+  - platform: template
+    name: Light Timelapse Frames
+    icon: mdi:flash-auto
+    entity_category: config
+    restore_mode: RESTORE_DEFAULT_ON
+    lambda: return id(remote_frames).light_frames();
+    turn_on_action:
+      - lambda: id(remote_frames).set_light_frames(true);
+    turn_off_action:
+      - lambda: id(remote_frames).set_light_frames(false);
+
+sensor:
+  # The sensor's exposure index read before the last upload (auto-exposure lines x gain; lit from
+  # dark_exposure, default 1000). For tuning dark_exposure on the bench.
+  - platform: template
+    name: Frame Exposure
+    icon: mdi:camera-iris
+    accuracy_decimals: 0
+    state_class: measurement
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: |-
+      const uint32_t e = id(remote_frames).last_exposure();
+      return (e == 0 || e == UINT32_MAX) ? NAN : (float) e;
+  - platform: template
+    name: Frames Lit
+    icon: mdi:flash
+    accuracy_decimals: 0
+    state_class: total_increasing
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: return id(remote_frames).frames_lit();
+  - platform: template
+    name: Frames Uploaded
+    icon: mdi:image-multiple
+    accuracy_decimals: 0
+    state_class: total_increasing
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: return id(remote_frames).uploads_ok();
+  - platform: template
+    name: Frame Upload Failures
+    icon: mdi:cloud-alert
+    accuracy_decimals: 0
+    state_class: total_increasing
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: return id(remote_frames).uploads_failed();
+
+text_sensor:
+  - platform: template
+    name: Remote Frames
+    icon: mdi:cloud-upload
+    entity_category: diagnostic
+    update_interval: 30s
+    lambda: |-
+      if (!id(remote_frames).remote_on()) return std::string("off");
+      return std::string(id(remote_frames).live() ? "live (someone is watching)" : "on");

@@ -1,0 +1,16 @@
+SAFETY AND WARRANTY DISCLAIMER
+
+This software is provided "as is", without warranty of any kind. You use it at your own risk.
+
+- UV-C: the chamber contains a UV-C lamp. UV-C light injures eyes and skin. Never look at the lamp
+  while it is on and never defeat the interlocks. The firmware keeps it off unless a person turns
+  it on.
+- Heat and unattended operation: the chamber contains a heater and an atomizer that run unattended.
+  Keep it away from flammable material, check it regularly and don't run modified firmware
+  unattended until you have tested it.
+- Flashing: replacing a device's firmware can make it unusable and may void any remaining
+  warranty. Back up the original firmware first.
+- Not affiliated: Terrashroom is a trademark of its owner. This project is not affiliated with or
+  endorsed by Terrashroom.
+
+Triple-3 LLC is not liable for any damage, injury or loss arising from the use of this software.

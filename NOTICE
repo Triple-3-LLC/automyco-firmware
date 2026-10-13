@@ -1,0 +1,7 @@
+AutoMyco firmware for the Terrashroom TS-01
+Copyright 2026 Triple-3 LLC
+
+Firmware images built from this repository include ESPHome (https://esphome.io), whose C++
+runtime is licensed under GPLv3 and whose Python tooling is licensed under MIT.
+
+The on-device dashboard (web/) is licensed under FSL-1.1-ALv2; see web/LICENSE.md.

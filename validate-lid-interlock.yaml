@@ -1,0 +1,12 @@
+# Validation build, not for flashing: the personal build plus the opt-in lid reed switch package
+# (common/lid-interlock.yaml, issue #28). CI runs `esphome config` and the safety checks on every
+# validate-*.yaml, so opt-in packages that no shipped build includes still get checked, and the UV-C
+# interlock rule in tools/check_firmware_safety.py has a build to bite on. To use the package for real,
+# add its line to your own build's packages instead.
+
+packages:
+  build: !include terrashroom.yaml
+  lid: !include common/lid-interlock.yaml
+
+esphome:
+  build_path: build/validate-lid-interlock   # relative to .esphome/; keeps the personal build's dir clean

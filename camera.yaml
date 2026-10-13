@@ -1,0 +1,142 @@
+# The personal build for the TS-01 camera board ("green PCB": ESP32 + PSRAM + camera sensor, stock firmware camera/0.1.7.09).
+# Replaces the cloud-only stock camera firmware with a local camera:
+#   - Password-protected MJPEG stream http://<camera-ip>:8080/stream and snapshot .../snapshot
+#   - Home Assistant camera entity + flash LED light, password-protected native OTA only
+#   - Uploads a frame every ${frame_interval} straight to your own S3 bucket (frame_uploader -> Lambda)
+#
+# The AI-Thinker pin map (common/camera-core.yaml) is confirmed on the green PCB.
+#
+#
+# Hardware, link, login (claimed by the app, as in the public build) and shared entities:
+# common/camera-core.yaml. This file adds your own Wi-Fi, API key and OTA password from
+# secrets.yaml, plus frame uploads to your own S3 bucket. The build anyone
+# else can use is camera-public.yaml (docs/camera-install.md).
+
+substitutions:
+  grow: golden-oyster-1        # S3 prefix for this grow's frames; change per grow
+  frame_interval: 300s         # one uploaded frame every 5 minutes
+
+packages:
+  core: !include common/camera-core.yaml
+
+api:
+  encryption:
+    key: !secret camera_api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "AutoMyco Camera Setup"
+    password: !secret fallback_ap_password
+
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [frame_uploader]
+
+# Upload a frame to your own S3 bucket via the frame-ingest Lambda (cloud/frame-ingest).
+# URL + token come from secrets.yaml (written by cloud/frame-ingest/deploy.sh); no AWS keys here.
+# The download needs the camera's only TLS session: no uploads while it runs.
+camera_update:
+  on_begin:
+    - lambda: id(uploader).set_paused(true);
+  on_abort:
+    - lambda: id(uploader).set_paused(false);
+
+frame_uploader:
+  - id: uploader
+    camera_id: chamber_camera
+    url: !secret frame_upload_url
+    token: !secret frame_upload_token
+    grow: ${grow}
+    update_interval: ${frame_interval}
+    camera_http_id: camera_web   # lights dark frames with the camera LED (Light Timelapse Frames)
+  # Remote frames for the chamber's remote dashboard and app (docs/remote-access.md "Camera"): the chamber
+  # hands over the credentials while Remote Access is on and paired; every 5 min, every 30 s while someone
+  # is watching. The timelapse above keeps its own frame-ingest uploads.
+  - id: remote_frames
+    camera_id: chamber_camera
+    remote_interval: 300s
+    update_interval: 15s
+    camera_http_id: camera_web
+
+chamber_link:
+  on_remote:
+    - lambda: |-
+        id(remote_frames).set_remote(url, device_id, key);
+
+switch:
+  # Light dark frames with the camera's LED (about 1.2-1.5 s, faded up, then back to what it was).
+  # Default ON. Daytime frames stay natural: only scenes the sensor reports as dark get lit.
+  - platform: template
+    name: Light Timelapse Frames
+    icon: mdi:flash-auto
+    entity_category: config
+    restore_mode: RESTORE_DEFAULT_ON
+    lambda: return id(uploader).light_frames();
+    turn_on_action:
+      - lambda: id(uploader).set_light_frames(true);
+    turn_off_action:
+      - lambda: id(uploader).set_light_frames(false);
+  - platform: template
+    name: Upload Frames
+    icon: mdi:cloud-upload
+    restore_mode: RESTORE_DEFAULT_ON
+    lambda: return id(uploader).is_enabled();
+    turn_on_action:
+      - lambda: id(uploader).set_enabled(true);
+    turn_off_action:
+      - lambda: id(uploader).set_enabled(false);
+
+sensor:
+  # The sensor's exposure index read before the last upload (auto-exposure lines x gain; lit from
+  # dark_exposure, default 1000). For tuning dark_exposure on the bench.
+  - platform: template
+    name: Frame Exposure
+    icon: mdi:camera-iris
+    accuracy_decimals: 0
+    state_class: measurement
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: |-
+      const uint32_t e = id(uploader).last_exposure();
+      return (e == 0 || e == UINT32_MAX) ? NAN : (float) e;
+  - platform: template
+    name: Frames Lit
+    icon: mdi:flash
+    accuracy_decimals: 0
+    state_class: total_increasing
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: return id(uploader).frames_lit();
+  - platform: template
+    name: Frames Uploaded
+    icon: mdi:image-multiple
+    accuracy_decimals: 0
+    state_class: total_increasing
+    update_interval: 60s
+    lambda: return id(uploader).uploads_ok();
+  - platform: template
+    name: Frame Upload Failures
+    icon: mdi:cloud-alert
+    accuracy_decimals: 0
+    state_class: total_increasing
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: return id(uploader).uploads_failed();
+
+text_sensor:
+  - platform: template
+    name: Remote Frames
+    icon: mdi:cloud-upload
+    entity_category: diagnostic
+    update_interval: 30s
+    lambda: |-
+      if (!id(remote_frames).remote_on()) return std::string("off");
+      return std::string(id(remote_frames).live() ? "live (someone is watching)" : "on");

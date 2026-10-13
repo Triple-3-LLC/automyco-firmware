@@ -1,0 +1,79 @@
+# Optional add-on: Home Assistant Bluetooth proxy, plus heap diagnostics to show whether the chamber can afford it.
+#
+# Include it as an extra package in a build (no build includes it by default):
+#   packages:
+#     core: !include common/terrashroom-core.yaml
+#     bluetooth_proxy: !include common/bluetooth-proxy.yaml
+#
+# The chamber then forwards nearby BLE advertisements to Home Assistant (plant sensors, thermometers,
+# trackers) and lends HA up to ${ble_proxy_slots} active GATT connections. It compiles on the core's
+# `framework: arduino` with ESPHome 2026.9.1 and coexists with esp32_improv (the public build's BLE
+# Wi-Fi setup): both share one esp32_ble stack. Numbers and the runtime-heap budget: README.md
+# ("Optional: Bluetooth proxy").
+#
+# The ESP32 has one 2.4 GHz radio, shared by Wi-Fi and BLE. Scanning takes airtime from Wi-Fi, so the
+# web UI and HA updates get a bit slower. Nothing in the grow loop uses the network, so control and
+# the interlocks are unaffected. The scan duty cycle is left at ESPHome's default (30 ms every 320 ms).
+#
+# Needs common/fleet-health.yaml (both main-board builds include it) for its Lowest Free Heap sensor.
+# Watch Heap Low / Heap Largest Block for a day after adding this. The cloud TLS client needs ~48 kB
+# of contiguous heap per request; if Heap Largest Block falls under ~50 kB or Lowest Free Heap under
+# ~20 kB, lower ble_proxy_slots to 1, or set ble_proxy_active to "false" (advertisements only).
+
+substitutions:
+  ble_proxy_active: "true"   # false = forward advertisements only (no connections, least RAM)
+  ble_proxy_slots: "2"       # active connections lent to HA (ESPHome default 3; 2 leaves room for TLS)
+
+esp32_ble:
+  # Controller-side connection limit: the proxy's slots + 1 for esp32_improv's GATT server.
+  max_connections: 3
+
+esp32_ble_tracker:
+  scan_parameters:
+    active: true   # ask devices for their scan response (names); HA's clients expect an active proxy
+    continuous: true
+
+bluetooth_proxy:
+  active: ${ble_proxy_active}
+  connection_slots: ${ble_proxy_slots}
+  cache_services: true   # GATT service cache in NVS: fewer round trips when HA reconnects to a device
+
+# Heap diagnostics. common/fleet-health.yaml (in both main-board builds) already reports Free Heap and
+# Lowest Free Heap; this adds the size of the largest free block, which (with the total) decides whether a
+# TLS handshake (a 20 kB block and 48 kB free, common/tls_budget.h) or a new BLE connection can allocate.
+debug:
+  update_interval: 60s
+
+sensor:
+  - platform: debug
+    block:
+      id: heap_largest_block
+      name: Heap Largest Block
+      entity_category: diagnostic
+      web_server:
+        sorting_group_id: grp_health
+        sorting_weight: 14
+    loop_time:
+      name: Loop Time   # BLE work runs in the main loop; a long loop shows the proxy is crowding it
+      entity_category: diagnostic
+      web_server:
+        sorting_group_id: grp_health
+        sorting_weight: 15
+
+binary_sensor:
+  - platform: template
+    name: Heap Low
+    device_class: problem
+    entity_category: diagnostic
+    # ON when the next TLS request would be refused (cloud_post.h: largest block under 20 kB or free
+    # under 48 kB, common/tls_budget.h), or the heap has come close to running out since boot (lowest
+    # free under 20 kB). If it stays ON, use fewer proxy slots (ble_proxy_slots: "1") or advertisements
+    # only (ble_proxy_active: "false").
+    lambda: |-
+      const float blk = id(heap_largest_block).state, low = id(fleet_min_free_heap).state;
+      const float free_now = id(fleet_free_heap).state;
+      if (isnan(blk) || isnan(low) || isnan(free_now)) return {};
+      return !ts_cloud::tls_heap_ok((size_t) blk, (size_t) free_now) || low < 20000;
+    web_server:
+      sorting_group_id: grp_health
+      sorting_weight: 16

@@ -1,0 +1,65 @@
+# Optional add-on: non-contact water-level sensor (XKC-Y25 / DFRobot SEN0369 class) stuck to the outside
+# of the reservoir, as a retrofit for the stock conductivity probe that misreads (issue #27,
+# docs/water-level-sensor.md; logic in common/water_level.h, host tests in tests/test_water_level.cpp).
+# Opt-in: no build includes it by default, and the public build must not (stock chambers have no such
+# sensor, and the image has to fit the stock app slot).
+#
+# Include it as an extra package in a personal build:
+#   packages:
+#     core: !include common/terrashroom-core.yaml
+#     water_level: !include common/water-level-sensor.yaml
+# then set Water Sensing to "Level Sensor".
+#
+# Wiring (docs/water-level-sensor.md has the diagram): sensor output -> 1 kOhm -> GPIO19 (module pad 31),
+# sensor GND to board GND, sensor supply from the 5 V logic rail (XKC-Y25 runs on 5-24 V). Use an
+# open-collector (NPN) sensor that pulls LOW when it sees water: the ESP32's pull-up holds the line at
+# 3.3 V otherwise, so the sensor's supply voltage never reaches the pin. A push-pull output must not
+# exceed 3.3 V (divide it down) and needs water_level_active_low: "false".
+#
+# Fail-safe: the pin is pulled toward "no water" (pull-up for active-low, pull-down for active-high), so
+# an unplugged, cut or unpowered sensor reads dry and Low Water locks the atomizer out (and cuts UV-C).
+# The core starts Low Water ON in Level Sensor mode and only this package can clear it, after 6 s of
+# uninterrupted water readings outside the atomizer's splash window. Going dry takes 10 s. The core's
+# Humidity Response check keeps running in this mode as a backup for a sensor stuck at "water".
+
+substitutions:
+  water_level_gpio: "19"            # GPIO19: plain I/O, not a strapping pin, internal pulls both ways (docs/hardware.md)
+  water_level_active_low: "true"    # true: LOW = water (NPN / open collector). false: HIGH = water
+
+esphome:
+  includes:
+    - common/water_level.h
+
+select:
+  - id: !extend water_sensing
+    options:
+      - Level Sensor
+
+binary_sensor:
+  - platform: template
+    id: water_level_sensor
+    name: Water Level Sensor   # ON = the sensor sees water (debounced), whatever Water Sensing is set to
+    device_class: moisture
+    entity_category: diagnostic
+    web_server:
+      sorting_group_id: grp_water
+      sorting_weight: 11
+
+interval:
+  - interval: 500ms
+    then:
+      - lambda: |-
+          namespace wl = water_level;
+          static wl::Debounce deb;
+          const bool active_low = ${water_level_active_low};
+          // Re-applied every read (as the core does for the probe), so nothing can leave the pin floating.
+          pinMode(${water_level_gpio}, wl::pull_up(active_low) ? INPUT_PULLUP : INPUT_PULLDOWN);
+          const uint32_t now = millis();
+          const bool wet = wl::raw_wet(digitalRead(${water_level_gpio}) == HIGH, active_low);
+          const bool splashing = id(atomizer).state || (uint32_t) (now - id(atomizer_off_at)) < wl::SPLASH_MS;
+          const bool was_dry = id(level_sensor_dry);
+          const bool dry = wl::update(deb, wet, splashing, now);
+          id(level_sensor_dry) = dry;   // the core's 2 s water interval folds this into Low Water
+          if (!id(water_level_sensor).has_state() || id(water_level_sensor).state == dry) id(water_level_sensor).publish_state(!dry);
+          if (dry != was_dry && std::string(id(water_sensing).current_option()) == "Level Sensor")
+            id(log_event).execute(dry ? "level sensor: no water" : "level sensor: water OK");

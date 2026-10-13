@@ -1,0 +1,485 @@
+# Remote access: see the chamber (temperature, humidity, setpoints, what's running, alarms) from outside
+# the home network, on automyco.com/remote. OFF by default. Nothing is sent until the owner switches
+# "Remote Access" on AND pairs the chamber with a code from automyco.com/remote.
+#
+# Include it as a package, with cloud-identity.yaml (it uses the Cloud Device ID + token, ${cloud_base_url}
+# and the shared, certificate-verified cloud_http client declared there):
+#   packages:
+#     remote_access: !include common/remote-access.yaml
+#
+# How it works
+#   - Outbound HTTPS only. The chamber opens no port and needs no port forwarding.
+#   - Remote control is limited to a fixed list: the telemetry reply can carry commands from the paired
+#     account (setpoints, fans, lights, preset, phase, start/end grow, fresh air, UV-C OFF only; the apply
+#     step below). Nothing remote can switch UV-C on or reach the heater, the atomizer, the hard stop, the
+#     water-lockout override, restart, self-test or firmware, and every interlock (heater over-temp cut-off,
+#     water lockout, UV-C) stays on the chamber. Because pairing hands that account control, the Remote
+#     Pairing Code is accepted only from the paired app (signed, web_guard) or inside the rear-button Pair
+#     window (common/owner_gate.h). If automyco.com is down, switched off or too expensive, the chamber grows
+#     exactly as before.
+#   - One sample a minute, kept in RAM (common/remote_access.h). Every ${remote_interval} the chamber
+#     POSTs what it has to ${cloud_base_url}/api/device/remote/telemetry, from its own FreeRTOS task, so
+#     the controller never waits on the network. A new alarm is sent within a minute, without waiting
+#     for the next slot, unless the server last said no (off for this account, wrong credentials), and
+#     only once per outage while it can't be reached.
+#   - Pairing: on automyco.com/remote, "Add a chamber" shows an 8-character code for 15 minutes. Type it into
+#     "Remote Pairing Code" (the iOS app, Home Assistant, or this page). Typing it on the chamber proves you
+#     have the chamber; the Cloud Device ID alone can't claim it. Public build: from the phone that paired at
+#     the chamber, or within 2 minutes of holding the rear button 2-4 s (anything else on the LAN is refused).
+#   - The server answers with a status code only: 403 (remote access is off for this account or chamber,
+#     or the owner switched the whole cloud off) backs off for an hour, 404 (not paired, or unpaired on
+#     the website) stops sending until a new code is entered, errors retry from 1 min up to 1 h.
+#
+# What is sent, and nothing else (site/lambda/remote-core.mjs drops anything else):
+#   per sample  time, uptime, temperature, humidity, both setpoints, Climate Control, atomizer, heater,
+#               Fan 1/2 and blower %, top/bottom light on/off, UV-C on/off (read only), alarm bits,
+#               Grow State text
+#   per POST    firmware version, Grow Preset, Grow Day, Wi-Fi signal, and the event-log lines (for
+#               example "mist on", "low water") added since the last accepted POST: at most 10, each cut
+#               to 80 characters, "grow started/ended" without the grow name (remote_access.h append_events)
+# The server deletes all of it after 30 days.
+#   ck          SHA-256 of the key this chamber gives its camera for frame uploads (below), never the key
+# Never sent: Wi-Fi names or passwords, IP or MAC addresses, the grow name.
+#
+# Camera: an AutoMyco camera on the chamber's camera wire gets a frame-upload key (HMAC of the device token,
+# never the token) while Remote Access is on and paired, and uploads a frame every 5 min in this chamber's
+# name (common/camera-remote.yaml on the camera; docs/remote-access.md "Camera").
+
+substitutions:
+  remote_interval: "300"   # seconds between POSTs (5 min). Lower costs more requests; see docs/remote-access.md
+
+esphome:
+  includes:
+    - common/remote_access.h
+  on_boot:
+    - priority: -100   # after the restored switch and globals are loaded
+      then:
+        - lambda: |-
+            if (!id(remote_access).state) id(remote_status).publish_state("Off");
+            else if (!id(remote_paired)) id(remote_status).publish_state(ts_remote::status_text(ts_remote::UNPAIRED));
+            else id(remote_status).publish_state("Starting");
+            id(remote_next_at) = millis() + 120000;   // first POST about 2 min after boot (samples first)
+            // Paired before the camera key had a salt (firmware older than this): start one now. Wi-Fi has
+            // started at -100, so the RNG is a real entropy source.
+            if (id(remote_paired) && id(remote_cam_salt)[0] == '\0') id(remote_new_cam_salt).execute();
+            // The camera: every time an AutoMyco camera says it's ready (boot, power cycle, status query),
+            // it gets its frame-upload credentials again (it keeps them in RAM only).
+            id(cam_link)->add_on_line_callback([](const std::string &line) {
+              if (line.find("\"status\":\"ready\"") != std::string::npos) id(remote_cam_due) = true;
+            });
+
+globals:
+  - id: remote_live_until      # millis() until which someone is watching remotely (0 = nobody): post every 25 s
+    type: uint32_t
+    initial_value: "0"
+  - id: remote_acks_sent       # acks carried by the post in flight (dropped once it's accepted)
+    type: uint32_t
+    initial_value: "0"
+  - id: remote_tick            # 20 s ticks: a sample every tick while watched, every third otherwise
+    type: uint8_t
+    initial_value: "0"
+  - id: remote_cam_salt        # random per pairing: the camera key is bound to it (remote_access.h camera_key)
+    type: std::array<char, 33>
+    restore_value: true
+    initial_value: 'std::array<char, 33>{}'
+  - id: remote_cam_state       # what the camera was last told: -1 nothing yet, 0 stop uploading, 1 upload
+    type: int8_t
+    initial_value: "-1"
+  - id: remote_cam_due         # the camera (re)announced itself: tell it again
+    type: bool
+    initial_value: "false"
+  - id: remote_paired          # the server accepted a pairing code (cleared by a 404)
+    type: bool
+    restore_value: true
+    initial_value: "false"
+  - id: remote_next_at         # millis() when the next POST is due
+    type: uint32_t
+    initial_value: "0"
+  - id: remote_stopped         # true after a 404: wait for a new pairing code
+    type: bool
+    initial_value: "false"
+  - id: remote_fails           # RETRY outcomes in a row
+    type: uint32_t
+    initial_value: "0"
+  - id: remote_in_flight       # 0 none, 1 telemetry, 2 pairing
+    type: uint8_t
+    initial_value: "0"
+  - id: remote_sent            # samples in the telemetry POST in flight
+    type: uint32_t
+    initial_value: "0"
+  - id: remote_last_alarms     # alarm bits of the last sample, to send new alarms straight away
+    type: uint16_t
+    initial_value: "0"
+  - id: remote_last_outcome    # ts_remote::Outcome of the last telemetry POST (OK until one has finished)
+    type: uint8_t
+    initial_value: "0"
+  - id: remote_early_used      # a new alarm already jumped the RETRY backoff once; the next waits its turn
+    type: bool
+    initial_value: "false"
+  - id: remote_ev_sent         # hash of the newest event-log line the server accepted (0 = none yet)
+    type: uint32_t
+    restore_value: true
+    initial_value: "0"
+  - id: remote_ev_pending      # hash of the newest event-log line in the POST in flight
+    type: uint32_t
+    initial_value: "0"
+
+switch:
+  - platform: template
+    id: remote_access
+    name: Remote Access
+    icon: mdi:cloud-eye-outline
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    on_turn_on:
+      - lambda: |-
+          id(remote_stopped) = false;
+          id(remote_fails) = 0;
+          id(remote_next_at) = millis() + 60000;   // first POST after the first sample
+          id(remote_status).publish_state(id(remote_paired) ? "Starting" : ts_remote::status_text(ts_remote::UNPAIRED));
+      - script.execute: { id: log_event, msg: "remote access on" }
+    on_turn_off:
+      - lambda: |-
+          ts_remote::g_ring.clear();
+          id(remote_status).publish_state("Off");
+      - script.execute: { id: log_event, msg: "remote access off" }
+    web_server:
+      sorting_group_id: grp_health
+      sorting_weight: 14
+
+text:
+  - platform: template
+    id: remote_pairing_code
+    name: Remote Pairing Code
+    icon: mdi:link-variant
+    entity_category: config
+    mode: text
+    max_length: 12
+    lambda: return {""};   # never shows a code back
+    set_action:
+      - lambda: |-
+          // Who's asking (common/owner_gate.h): the paired app (web_guard already checked its signed key) or
+          // someone at the chamber. The owner's build sets no gate, so it's always "present" there.
+          if (!owner_gate::paired_or_present()) {
+            id(remote_status).publish_state("Hold the rear button 2-4 s, then enter the code again (or use the paired app)");
+            return;
+          }
+          const std::string code = ts_remote::normalise_code(x);
+          if (code.empty()) {
+            id(remote_status).publish_state("That isn't a pairing code (8 letters and numbers)");
+            return;
+          }
+          if (!id(remote_access).state) id(remote_access).turn_on();
+          if (!network::is_connected() || id(remote_in_flight) != 0 ||
+              !ts_remote::post_async(id(cloud_http), "${cloud_base_url}/api/device/remote/pair",
+                                     std::string("{\"code\":\"") + code + "\",\"v\":\"" ESPHOME_PROJECT_VERSION "\"}",
+                                     id(cloud_device_id).data(), id(cloud_device_token).data())) {
+            id(remote_status).publish_state("Busy or offline; enter the code again in a minute");
+            return;
+          }
+          id(remote_in_flight) = 2;
+          id(remote_status).publish_state("Pairing...");
+    web_server:
+      sorting_group_id: grp_health
+      sorting_weight: 15
+
+text_sensor:
+  - platform: template
+    id: remote_status
+    name: Remote Status
+    icon: mdi:cloud-check-outline
+    entity_category: diagnostic
+    update_interval: never
+    web_server:
+      sorting_group_id: grp_health
+      sorting_weight: 16
+
+interval:
+  # Results of the background POST (cheap: one atomic read).
+  - interval: 2s
+    then:
+      # Camera frames (docs/remote-access.md "Camera"): an AutoMyco camera uploads a frame every 5 min in
+      # this chamber's name while Remote Access is on and paired. It gets a key derived for frames only
+      # (ts_remote::camera_key), never the device token, over the camera wire (the same wire that already
+      # carries the Wi-Fi password). A stock camera ignores the line.
+      - lambda: |-
+          // The token changed (cloud-identity.yaml rotation): the camera's frame key is derived from it, so
+          // tell the camera again, and report soon so the server learns the new key's hash (`ck`).
+          static uint32_t token_gen = 0;
+          if (token_gen != ts_identity::g_token_gen) {
+            token_gen = ts_identity::g_token_gen;
+            id(remote_cam_due) = true;
+            id(remote_fails) = 0;
+            if ((int32_t) (id(remote_next_at) - millis()) > 10000) id(remote_next_at) = millis() + 10000;
+          }
+          const bool want = id(remote_access).state && id(remote_paired) && !id(remote_stopped);
+          if ((int8_t) want == id(remote_cam_state) && !id(remote_cam_due)) return;
+          if (!id(cam_link)->camera_ready() || id(cam_link)->installing()) return;   // told again when it says ready
+          std::string line;
+          if (want) {
+            char key[65], hash[65];
+            if (!ts_remote::camera_key(id(cloud_device_token).data(), id(remote_cam_salt).data(), key, hash)) return;
+            line = ts_remote::camera_line("${cloud_base_url}", id(cloud_device_id).data(), key);
+            memset(key, 0, sizeof(key));
+          } else {
+            line = ts_remote::camera_line(nullptr, nullptr, nullptr);
+          }
+          id(cam_uart).write_str(line.c_str());   // straight to the wire: camera_link would log the line
+          id(cam_uart).write_byte('\n');
+          std::fill(line.begin(), line.end(), '\0');
+          id(remote_cam_state) = want;
+          id(remote_cam_due) = false;
+          ESP_LOGI("remote", "camera frame uploads %s", want ? "on" : "off");
+      - lambda: |-
+          const int st = ts_remote::take_status();
+          if (st == 0) return;
+          const uint8_t kind = id(remote_in_flight);
+          id(remote_in_flight) = 0;
+          const auto o = ts_remote::classify(st);
+          if (kind == 2) {   // pairing
+            if (o == ts_remote::OK) {
+              id(remote_paired) = true;
+              id(remote_stopped) = false;
+              id(remote_fails) = 0;
+              id(remote_next_at) = millis() + 5000;   // first report straight away
+              ts_persist_now(remote_paired);
+              id(remote_new_cam_salt).execute();       // a new camera key for this pairing (saved at once)
+              id(remote_status).publish_state("Paired");
+              id(log_event).execute("remote access paired");
+              // Typing the code proves someone is at the chamber: replace the cloud token, so a copy read
+              // out of flash by a previous owner stops working (cloud-identity.yaml "Token rotation").
+              id(cloud_rotate_start).execute("remote pairing", ts_rotation::REASON_REMOTE_PAIR);
+            } else if (o == ts_remote::OFF) {
+              id(remote_status).publish_state("Remote access isn't enabled for that AutoMyco account");
+            } else if (o == ts_remote::AUTH) {
+              // 401: the token isn't this ID's any more (a previous owner rotated it with a copy). Typing the
+              // code proves someone is at the chamber, so recover: the rotation is refused too and the chamber
+              // starts over with a new ID (cloud-identity.yaml). The code isn't used up by a 401.
+              id(cloud_rotate_start).execute("pairing refused the token", ts_rotation::REASON_REMOTE_PAIR);
+              id(remote_status).publish_state("Cloud identity was refused and is being replaced; enter the code again in a minute");
+            } else if (o == ts_remote::RETRY) {
+              id(remote_status).publish_state("Couldn't reach automyco.com; enter the code again");
+            } else {
+              id(remote_status).publish_state("Pairing code not accepted (wrong or expired)");
+            }
+            return;
+          }
+          // telemetry
+          if (o == ts_remote::OK || o == ts_remote::REJECTED) ts_remote::g_ring.drop_front(id(remote_sent));
+          if (o == ts_remote::OK) id(remote_ev_sent) = id(remote_ev_pending);   // event lines: only on 2xx
+          id(remote_sent) = 0;
+          id(remote_fails) = o == ts_remote::RETRY ? id(remote_fails) + 1 : 0;
+          if (o == ts_remote::UNPAIRED) {
+            id(remote_paired) = false;
+            id(remote_stopped) = true;
+            ts_remote::g_ring.clear();
+            id(remote_cam_salt).fill(0);   // the camera key dies with the pairing
+            ts_persist_now(remote_paired, remote_cam_salt);
+          }
+          if (o != ts_remote::OK) ESP_LOGW("remote", "report answered HTTP %d", st);
+          id(remote_last_outcome) = (uint8_t) o;
+          if (o == ts_remote::OK) id(remote_early_used) = false;   // a delivered report earns the next alarm its fast lane
+          id(remote_next_at) = millis() + 1000UL * ts_remote::retry_delay_s(o, ${remote_interval}, id(remote_fails));
+          id(remote_status).publish_state(ts_remote::status_text(o));
+          if (o != ts_remote::OK) return;
+          ts_remote::g_acks.delivered(id(remote_acks_sent));
+          id(remote_acks_sent) = 0;
+          // The reply: live mode and remote commands (docs/remote-access.md "Live mode and remote control").
+          uint32_t live_s = 0;
+          std::vector<ts_remote::Cmd> cmds;
+          ts_remote::parse_reply(ts_remote::g_reply, live_s, cmds);
+          ts_remote::g_reply.clear();
+          id(remote_live_until) = live_s ? (millis() + live_s * 1000UL) | 1 : 0;
+          if (live_s) {
+            id(remote_next_at) = millis() + ts_remote::LIVE_POST_S * 1000UL;
+            id(remote_status).publish_state("Connected (someone is watching)");
+          }
+          // Remote commands. Only these actions exist; every number is clamped to the entity's own limits,
+          // and the chamber's interlocks still decide (a fan or light change pauses Climate Control exactly
+          // as a change on the chamber's own page does). UV-C can only be switched OFF; nothing here can switch
+          // it on, or reach the heater, the atomizer, the hard stop, the water-lockout override, restart,
+          // self-test or firmware.
+          auto apply = [](const ts_remote::Cmd &c) -> std::string {
+            char buf[48];
+            auto number = [&](number::Number *n) -> std::string {
+              if (std::isnan(c.n)) return "refused: not a number";
+              bool clamped = false;
+              const float v = ts_remote::clamp_to(c.n, n->traits.get_min_value(), n->traits.get_max_value(), clamped);
+              auto call = n->make_call();
+              call.set_value(v);
+              call.perform();
+              if (!clamped) return "ok";
+              snprintf(buf, sizeof(buf), "clamped to %g", v);
+              return buf;
+            };
+            auto speed = [&](fan::Fan *f) -> std::string {
+              if (std::isnan(c.n)) return "refused: not a number";
+              bool clamped = false;
+              const int v = (int) ts_remote::clamp_to(c.n, 0, 100, clamped);
+              if (v == 0) {
+                f->turn_off().perform();
+              } else {
+                auto call = f->make_call();
+                call.set_state(true);
+                call.set_speed(v);
+                call.perform();
+              }
+              if (!clamped) return "ok";
+              snprintf(buf, sizeof(buf), "clamped to %d", v);
+              return buf;
+            };
+            auto light = [&](light::LightState *l) -> std::string {
+              if (std::isnan(c.n)) return "refused: not on/off";
+              (c.n >= 0.5f ? l->turn_on() : l->turn_off()).perform();
+              return "ok";
+            };
+            auto pick = [&](select::Select *s) -> std::string {
+              if (!s->has_option(c.s)) return "refused: not an option here";
+              s->make_call().set_option(c.s).perform();
+              return "ok";
+            };
+            const std::string &a = c.a;
+            if (a == "cc") {
+              if (std::isnan(c.n)) return "refused: not on/off";
+              c.n >= 0.5f ? id(climate_control).turn_on() : id(climate_control).turn_off();
+              return "ok";
+            }
+            if (a == "srh") return number(id(humidity_setpoint));
+            if (a == "stf") return number(id(temperature_setpoint));
+            if (a == "lh") return number(id(light_hours));
+            if (a == "f1") return speed(id(fan_1));
+            if (a == "f2") return speed(id(fan_2));
+            if (a == "bl") return speed(id(blower));
+            if (a == "lt") return light(id(top_light));
+            if (a == "lb") return light(id(bottom_light));
+            if (a == "preset") return pick(id(grow_preset));
+            if (a == "phase") return pick(id(grow_phase));
+            if (a == "grow" && c.s == "start") { id(btn_start_grow).press(); return "ok"; }
+            if (a == "grow" && c.s == "end") { id(btn_end_grow).press(); return "ok"; }
+            // Only an open question can be answered remotely: Advance Phase with none open would skip a phase.
+            if (a == "answer" && !id(phase_check).state) return "refused: no phase question open";
+            if (a == "answer" && c.s == "advance") { id(btn_advance_phase).press(); return "ok"; }
+            if (a == "answer" && c.s == "not_yet") { id(btn_not_yet).press(); return "ok"; }
+            // UV-C: OFF only. Switching it off is always the safe direction; nothing remote can switch it on.
+            if (a == "uv") {
+              if (std::isnan(c.n) || c.n != 0.0f) return "refused: UV-C only switches off remotely";
+              id(uv_lamp).turn_off();
+              return "ok";
+            }
+            if (a == "fae" && c.s == "now") { id(btn_fresh_air_now).press(); return "ok"; }
+            return "refused: not allowed remotely";
+          };
+          for (const auto &c : cmds) {
+            const std::string r = apply(c);
+            ts_remote::g_acks.add(c.i, r.c_str());
+            char line[96];
+            snprintf(line, sizeof(line), "remote change: %s %s%s (%s)", c.a.c_str(), c.s.c_str(),
+                     std::isnan(c.n) ? "" : str_sprintf("%g", c.n).c_str(), r.c_str());
+            id(log_event).execute(line);
+          }
+          // Answer the commands soon, so the dashboard and the app see them applied: 21 s, just past the
+          // server's 20 s minimum between posts (MIN_POST_GAP_S). Sooner gets a 429, which backs off a minute.
+          if (!cmds.empty()) id(remote_next_at) = millis() + 21000;
+  # One sample a minute (every 20 s while someone's watching); POST when due, or straight away when a new
+  # alarm appears.
+  - interval: 20s
+    then:
+      - lambda: |-
+          if (!id(remote_access).state || !id(remote_paired) || id(remote_stopped)) return;
+          const bool live = id(remote_live_until) != 0 && (int32_t) (millis() - id(remote_live_until)) < 0;
+          if (!live && id(remote_live_until) != 0) {
+            id(remote_live_until) = 0;   // nobody watching any more: back to the normal interval
+            id(remote_status).publish_state("Connected");
+          }
+          if (!live && (++id(remote_tick) % 3) != 0) return;
+          ts_remote::Sample s;
+          auto now = id(sntp_time).now();
+          s.t = now.is_valid() ? (uint32_t) now.timestamp : 0;
+          s.up = millis() / 1000;
+          s.temp_f = id(temperature).state;
+          s.rh = id(humidity).state;
+          s.sp_rh = id(humidity_setpoint).state;
+          s.sp_t = id(temperature_setpoint).state;
+          s.climate = id(climate_control).state;
+          s.atomizer = id(atomizer).state;
+          s.heater = id(heater).state;
+          s.fan1 = id(fan_1).state ? id(fan_1).speed : 0;
+          s.fan2 = id(fan_2).state ? id(fan_2).speed : 0;
+          s.blower = id(blower).state ? id(blower).speed : 0;
+          s.top = id(top_light).current_values.is_on();
+          s.bottom = id(bottom_light).current_values.is_on();
+          s.uv = id(uv_lamp).state;
+          ts_remote::set_state(s, id(grow_state).state.c_str());
+          const bool stale = (uint32_t) (millis() - id(last_climate_update)) > ${stale_sensor_s} * 1000UL;
+          uint16_t a = 0;
+          if (id(low_water).state) a |= ts_remote::A_LOW_WATER;
+          if (id(tank_empty_alert).state) a |= ts_remote::A_TANK_EMPTY;
+          if (id(atomizer_hard_stop).state) a |= ts_remote::A_HARD_STOP;
+          if (id(booted) && !id(hdc_heating) && (std::isnan(s.temp_f) || std::isnan(s.rh) || stale)) a |= ts_remote::A_SENSOR;
+          if (!std::isnan(s.temp_f) && s.temp_f > ${max_safe_temp_f}) a |= ts_remote::A_OVERTEMP;
+          if (id(fan_1_missing).state) a |= ts_remote::A_FAN1;
+          if (id(fan_2_missing).state) a |= ts_remote::A_FAN2;
+          if (id(blower_missing).state) a |= ts_remote::A_BLOWER;
+          if (id(atomizer_missing).state) a |= ts_remote::A_ATOMIZER;
+          if (id(heater_missing).state) a |= ts_remote::A_HEATER;
+          s.alarms = a;
+          ts_remote::g_ring.push(s);
+          const bool new_alarm = (a & ~id(remote_last_alarms)) != 0;
+          id(remote_last_alarms) = a;
+
+          if (id(remote_in_flight) != 0 || !network::is_connected()) return;
+          // A new alarm normally goes out straight away. Not after the server said no (OFF: remote access
+          // is off for this account; AUTH: wrong credentials): posting sooner can't change the answer and
+          // would turn every alarm edge into a request. While the server is unreachable (RETRY) one alarm
+          // may jump the backoff; after that the backoff holds until a report is delivered.
+          const auto lo = (ts_remote::Outcome) id(remote_last_outcome);
+          bool early = new_alarm;
+          if (lo == ts_remote::OFF || lo == ts_remote::AUTH) early = false;
+          else if (lo == ts_remote::RETRY && id(remote_early_used)) early = false;
+          if (!early && (int32_t) (millis() - id(remote_next_at)) < 0) return;
+          const float gd = id(grow_day).state;
+          const float rssi = wifi::global_wifi_component->wifi_rssi();
+          char preset[33];   // cloud recipe names can hold any printable text: keep the JSON valid
+          ts_remote::json_safe(preset, sizeof(preset), id(grow_preset).current_option().c_str());
+          // ck: SHA-256 of the camera's frame key, so the server can check frames without the token.
+          char cam_key[65], ck[65];
+          ts_remote::camera_key(id(cloud_device_token).data(), id(remote_cam_salt).data(), cam_key, ck);   // ck empty without a salt
+          memset(cam_key, 0, sizeof(cam_key));
+          // lh/ph/pd/pq: light hours, grow phase, phase day, and whether the phase question is open, so a
+          // remote app can show (and answer) them without ever having seen the chamber on the LAN.
+          const float lh = id(light_hours).state, pd = id(phase_day).state;
+          char phase[17];
+          ts_remote::json_safe(phase, sizeof(phase), id(grow_phase).current_option().c_str());
+          char info[320];
+          snprintf(info, sizeof(info), "\"v\":\"%.32s\",\"preset\":\"%s\",\"day\":%d,\"rssi\":%d,\"ck\":\"%s\",\"lh\":%d,\"ph\":\"%s\",\"pd\":%d,\"pq\":%d",
+                   ESPHOME_PROJECT_VERSION, preset, std::isnan(gd) ? 0 : (int) gd, std::isnan(rssi) ? 0 : (int) rssi, ck,
+                   std::isnan(lh) ? -1 : (int) lh, phase, std::isnan(pd) ? 0 : (int) pd, id(phase_check).state ? 1 : 0);
+          std::string extra = info;
+          const uint32_t ev_mark = ts_remote::append_events(extra, id(evlog).data(), id(evlog).size(), id(remote_ev_sent));
+          size_t acks = 0;
+          extra += ts_remote::g_acks.take_for_post(acks);   // answers to earlier remote commands
+          size_t taken = 0;
+          std::string body = ts_remote::telemetry_json(ts_remote::g_ring, millis() / 1000, extra, taken);
+          if (!ts_remote::post_async(id(cloud_http), "${cloud_base_url}/api/device/remote/telemetry", std::move(body),
+                                     id(cloud_device_id).data(), id(cloud_device_token).data())) {
+            id(remote_next_at) = millis() + 60000;   // busy or short on heap: next minute
+            return;
+          }
+          if (early && lo == ts_remote::RETRY && (int32_t) (millis() - id(remote_next_at)) < 0) id(remote_early_used) = true;
+          id(remote_sent) = taken;
+          id(remote_acks_sent) = acks;
+          id(remote_ev_pending) = ev_mark;
+          id(remote_in_flight) = 1;
+
+script:
+  # A fresh camera-key salt (on every successful pairing): the old camera key stops working as soon as
+  # the next telemetry post reports the new key's hash, and the camera is told the new key at once.
+  - id: remote_new_cam_salt
+    then:
+      - lambda: |-
+          uint8_t rnd[16];
+          random_bytes(rnd, sizeof(rnd));
+          for (size_t i = 0; i < sizeof(rnd); i++) snprintf(id(remote_cam_salt).data() + 2 * i, 3, "%02x", rnd[i]);
+          ts_persist_now(remote_cam_salt);
+          id(remote_cam_due) = true;

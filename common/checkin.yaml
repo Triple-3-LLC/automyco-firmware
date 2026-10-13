@@ -1,0 +1,143 @@
+# Opt-in anonymous check-in: one HTTPS POST a day to automyco.com so the project can count how many
+# chambers are still running, and on which version. OFF by default, and nothing is sent until the owner
+# switches "Anonymous Check-in" on (web UI, Home Assistant or the iOS app).
+#
+# Include it as a package in a build (both builds do):
+#   packages:
+#     core: !include common/terrashroom-core.yaml
+#     checkin: !include common/checkin.yaml
+#
+# What is sent, and nothing else:
+#   {"id": "<32 hex>", "v": "<firmware version>", "b": "<owner|public>"}
+#   id  random install ID, made on the chamber the first time the switch is turned on. It isn't derived
+#       from the MAC, the cloud device ID or anything else. It is kept across reboots, firmware updates,
+#       power cuts and off/on toggles, so each chamber is counted once. Turning the switch off stops the
+#       check-ins straight away. The "Reset Check-in ID" button (config) erases the ID: if the switch is
+#       on, a new unrelated one is made at once; if it is off, nothing is kept until it is turned on again.
+#       (Up to 1.2.0, turning the switch off erased the ID.)
+#   v   esphome.project.version
+#   b   which build is running (checkin_build below)
+# The server (site/lambda/checkin-core.mjs) keeps the ID, version, build and the first and last check-in
+# date. It doesn't store the IP address, and a row expires 120 days after the chamber's last check-in.
+#
+# Safety: the request runs on the main loop, and the HTTP client blocks it until the request finishes
+# (cloud_http's timeout). The heater's over-temperature cut-off runs on that loop, so a check-in is only sent
+# while the heater is off. When the heater is on, the check-in is retried 10 minutes later.
+#
+# TLS: uses the shared `cloud_http` client from common/cloud-identity.yaml (include that package too; both
+# builds do). On the ESP32, ESPHome's http_request uses the ESP-IDF client and checks the certificate
+# against the built-in CA bundle, so the server is authenticated as well as encrypted.
+
+substitutions:
+  checkin_build: owner   # terrashroom-public.yaml overrides this with "public"
+  checkin_url: https://automyco.com/api/checkin
+
+globals:
+  # Random install ID; empty = none yet. Keep the id, type and restore_value exactly as they are: the
+  # flash key is the MD5 of the id and the slot is sizeof(type), so renaming it or changing its type would
+  # quietly give every chamber a new ID on its next update, and the server would count it twice.
+  - id: checkin_id
+    type: std::array<char, 33>
+    restore_value: true
+    initial_value: 'std::array<char, 33>{}'
+  - id: checkin_last_ms       # millis() of the last attempt this boot (0 = none yet)
+    type: uint32_t
+    initial_value: "0"
+
+switch:
+  - platform: template
+    id: checkin_enabled
+    name: Anonymous Check-in
+    icon: mdi:counter
+    entity_category: config
+    web_server:
+      sorting_group_id: grp_health
+      sorting_weight: 90
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    # ESPHome also runs these two triggers at every boot: the template switch's setup restores the saved
+    # state by calling turn_on()/turn_off(). checkin_id is already loaded by then (globals are set up
+    # first, at priority HARDWARE; the switch at HARDWARE - 2). So neither trigger may erase the ID.
+    # Up to 1.2.0, on_turn_off erased it, and any boot that restored the switch as OFF wiped the ID; when
+    # the switch was turned on again, the same chamber got a second ID and was counted twice.
+    on_turn_on:
+      - lambda: |-
+          if (id(checkin_id)[0] == '\0') {
+            // First opt-in (or after Reset Check-in ID). Normally turned on over the network, so the radio
+            // is up and the ESP32 RNG is a real entropy source.
+            id(checkin_new_id).execute();
+          }
+          id(checkin_last_ms) = 0;   // send at the next 10-minute tick, not tomorrow
+      - script.execute: { id: log_event, msg: "anonymous check-in on" }
+      # The switch saves its own state only after this trigger has run, so flush it soon as well:
+      # otherwise a power cut in the next 60 s brings the chamber back with the switch off.
+      - script.execute: save_now
+    on_turn_off:
+      # Stops the check-ins. The ID is kept, so turning the switch on again doesn't count this chamber a
+      # second time. Reset Check-in ID is the way to forget it.
+      - script.execute: { id: log_event, msg: "anonymous check-in off" }
+      - script.execute: save_now
+
+button:
+  - platform: template
+    id: checkin_reset_id
+    name: Reset Check-in ID
+    icon: mdi:counter
+    entity_category: config
+    web_server:
+      sorting_group_id: grp_health
+      sorting_weight: 91
+    on_press:
+      - lambda: |-
+          id(checkin_id).fill(0);
+          if (id(checkin_enabled).state) {
+            id(checkin_new_id).execute();   // still opted in: carry on under a new, unrelated ID
+            id(checkin_last_ms) = 0;
+          } else {
+            ts_persist_now(checkin_id);     // off: nothing is kept until the switch is turned on again
+          }
+      - script.execute: { id: log_event, msg: "anonymous check-in ID reset" }
+
+script:
+  # Makes a new random install ID and writes it to flash at once.
+  - id: checkin_new_id
+    then:
+      - lambda: |-
+          uint8_t rnd[16];
+          random_bytes(rnd, sizeof(rnd));
+          for (size_t i = 0; i < sizeof(rnd); i++) snprintf(id(checkin_id).data() + 2 * i, 3, "%02x", rnd[i]);
+          ts_persist_now(checkin_id);
+
+interval:
+  # Every 10 minutes, decide whether a check-in is due: the first one 10 minutes after boot (or after the
+  # switch is turned on), then one a day. Signed difference, so millis() wrap is harmless.
+  - interval: 10min
+    then:
+      - if:
+          condition:
+            lambda: |-
+              if (!id(checkin_enabled).state || id(checkin_id)[0] == '\0') return false;
+              if (!wifi::global_wifi_component->is_connected()) return false;
+              if (id(heater).state) return false;   // see "Safety" above: retry in 10 minutes
+              if (!ts_cloud::tls_ready()) return false;   // another cloud request, or low heap: retry in 10 minutes
+              const uint32_t now = millis();
+              return id(checkin_last_ms) == 0 || (int32_t) (now - id(checkin_last_ms)) >= 86400000;
+          then:
+            - lambda: |-
+                id(checkin_last_ms) = millis() | 1;   // never 0, which means "not yet"
+            - http_request.post:
+                url: ${checkin_url}
+                request_headers:
+                  Content-Type: application/json
+                body: !lambda |-
+                  return std::string("{\"id\":\"") + id(checkin_id).data() + "\",\"v\":\"" ESPHOME_PROJECT_VERSION
+                         "\",\"b\":\"${checkin_build}\"}";
+                capture_response: false
+                on_response:
+                  then:
+                    - logger.log:
+                        format: "check-in sent (HTTP %d)"
+                        args: [response->status_code]
+                on_error:
+                  then:
+                    - logger.log: "check-in failed; next try in 24 h"
